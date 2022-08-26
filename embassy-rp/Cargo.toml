@@ -12,15 +12,16 @@ flavors = [
 ]
 
 [features]
-
 # Reexport the PAC for the currently enabled chip at `embassy_rp::pac`.
 # This is unstable because semver-minor (non-breaking) releases of embassy-rp may major-bump (breaking) the PAC version.
 # If this is an issue for you, you're encouraged to directly depend on a fixed version of the PAC.
 # There are no plans to make this stable.
 unstable-pac = []
 
+time-driver = []
+
 # Enable nightly-only features
-nightly = ["embassy-executor/nightly", "embedded-hal-1", "embedded-hal-async", "embassy-embedded-hal/nightly"]
+nightly = ["embassy-executor/nightly", "embedded-hal-1", "embedded-hal-async", "embassy-embedded-hal/nightly", "embedded-io"]
 
 # Implement embedded-hal 1.0 alpha traits.
 # Implement embedded-hal-async traits if `nightly` is set as well.
@@ -42,6 +43,7 @@ cortex-m-rt = ">=0.6.15,<0.8"
 cortex-m = "0.7.6"
 critical-section = "1.1"
 futures = { version = "0.3.17", default-features = false, features = ["async-await"] }
+embedded-io = { version = "0.3.0", features = ["async"], optional = true }
 
 rp2040-pac2 = { git = "https://github.com/embassy-rs/rp2040-pac2", rev="9ad7223a48a065e612bc7dc7be5bf5bd0b41cfc4", features = ["rt"] }
 #rp2040-pac2 = { path = "../../rp/rp2040-pac2", features = ["rt"] }
