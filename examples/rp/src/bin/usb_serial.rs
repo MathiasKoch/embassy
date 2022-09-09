@@ -1,41 +1,49 @@
 #![no_std]
 #![no_main]
+#![feature(generic_associated_types)]
 #![feature(type_alias_impl_trait)]
 
-use defmt::{panic, *};
+use defmt::{info, panic};
 use embassy_executor::Spawner;
-use embassy_stm32::rcc::*;
-use embassy_stm32::usb::{Driver, Instance};
-use embassy_stm32::{interrupt, Config};
+use embassy_rp::interrupt;
+use embassy_rp::usb::{Driver, Instance};
 use embassy_usb::driver::EndpointError;
-use embassy_usb::Builder;
+use embassy_usb::{Builder, Config};
 use embassy_usb_serial::{CdcAcmClass, State};
 use futures::future::join;
 use {defmt_rtt as _, panic_probe as _};
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
-    let mut config = Config::default();
-    config.rcc.mux = ClockSrc::PLL(PLLSource::HSI16, PLLClkDiv::Div2, PLLSrcDiv::Div1, PLLMul::Mul10, None);
-    config.rcc.hsi48 = true;
-    let p = embassy_stm32::init(config);
+    info!("Hello there!");
 
-    info!("Hello World!");
+    let p = embassy_rp::init(Default::default());
 
     // Create the driver, from the HAL.
-    let irq = interrupt::take!(USB_FS);
-    let driver = Driver::new(p.USB, irq, p.PA12, p.PA11);
+    let irq = interrupt::take!(USBCTRL_IRQ);
+    let driver = Driver::new(p.USB, irq);
 
     // Create embassy-usb Config
-    let config = embassy_usb::Config::new(0xc0de, 0xcafe);
-    //config.max_packet_size_0 = 64;
+    let mut config = Config::new(0xc0de, 0xcafe);
+    config.manufacturer = Some("Embassy");
+    config.product = Some("USB-serial example");
+    config.serial_number = Some("12345678");
+    config.max_power = 100;
+    config.max_packet_size_0 = 64;
+
+    // Required for windows compatiblity.
+    // https://developer.nordicsemi.com/nRF_Connect_SDK/doc/1.9.1/kconfig/CONFIG_CDC_ACM_IAD.html#help
+    config.device_class = 0xEF;
+    config.device_sub_class = 0x02;
+    config.device_protocol = 0x01;
+    config.composite_with_iads = true;
 
     // Create embassy-usb DeviceBuilder using the driver and config.
     // It needs some buffers for building the descriptors.
     let mut device_descriptor = [0; 256];
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
-    let mut control_buf = [0; 7];
+    let mut control_buf = [0; 64];
 
     let mut state = State::new();
 

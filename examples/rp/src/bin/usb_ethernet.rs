@@ -10,20 +10,17 @@ use defmt::*;
 use embassy_executor::Spawner;
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{PacketBox, PacketBoxExt, PacketBuf, Stack, StackResources};
-use embassy_stm32::rcc::*;
-use embassy_stm32::rng::Rng;
-use embassy_stm32::usb::Driver;
-use embassy_stm32::{interrupt, Config};
+use embassy_rp::usb::Driver;
+use embassy_rp::{interrupt, peripherals};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
-use embassy_usb::{Builder, UsbDevice};
+use embassy_usb::{Builder, Config, UsbDevice};
 use embassy_usb_ncm::{CdcNcmClass, Receiver, Sender, State};
 use embedded_io::asynch::Write;
-use rand_core::RngCore;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-type MyDriver = Driver<'static, embassy_stm32::peripherals::USB>;
+type MyDriver = Driver<'static, peripherals::USB>;
 
 macro_rules! singleton {
     ($val:expr) => {{
@@ -84,17 +81,14 @@ async fn net_task(stack: &'static Stack<Device>) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let mut config = Config::default();
-    config.rcc.mux = ClockSrc::PLL(PLLSource::HSI16, PLLClkDiv::Div2, PLLSrcDiv::Div1, PLLMul::Mul10, None);
-    config.rcc.hsi48 = true;
-    let p = embassy_stm32::init(config);
+    let p = embassy_rp::init(Default::default());
 
     // Create the driver, from the HAL.
-    let irq = interrupt::take!(USB_FS);
-    let driver = Driver::new(p.USB, irq, p.PA12, p.PA11);
+    let irq = interrupt::take!(USBCTRL_IRQ);
+    let driver = Driver::new(p.USB, irq);
 
     // Create embassy-usb Config
-    let mut config = embassy_usb::Config::new(0xc0de, 0xcafe);
+    let mut config = Config::new(0xc0de, 0xcafe);
     config.manufacturer = Some("Embassy");
     config.product = Some("USB-Ethernet example");
     config.serial_number = Some("12345678");
@@ -165,8 +159,7 @@ async fn main(spawner: Spawner) {
     //});
 
     // Generate random seed
-    let mut rng = Rng::new(p.RNG);
-    let seed = rng.next_u64();
+    let seed = 1234; // guaranteed random, chosen by a fair dice roll
 
     // Init network stack
     let device = Device { mac_addr: our_mac_addr };
