@@ -26,6 +26,7 @@ nightly = [
     "embedded-hal-async",
     "embassy-embedded-hal/nightly",
     "dep:embassy-usb",
+    "dep:embedded-io",
 ]
 
 # Implement embedded-hal 1.0 alpha traits.
