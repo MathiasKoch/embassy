@@ -119,13 +119,16 @@ embassy_hal_common::peripherals! {
     NVMC,
 
     // UARTE, TWI & SPI
-    UARTETWISPI0,
-    UARTETWISPI1,
-    UARTETWISPI2,
-    UARTETWISPI3,
+    SERIAL0,
+    SERIAL1,
+    SERIAL2,
+    SERIAL3,
 
     // SAADC
     SAADC,
+
+    // RNG
+    RNG,
 
     // PWM
     PWM0,
@@ -242,15 +245,17 @@ embassy_hal_common::peripherals! {
     P1_15,
 }
 
-impl_uarte!(UARTETWISPI0, UARTE0, SERIAL0);
-impl_spim!(UARTETWISPI0, SPIM0, SERIAL0);
-impl_spis!(UARTETWISPI0, SPIS0, SERIAL0);
-impl_twim!(UARTETWISPI0, TWIM0, SERIAL0);
-impl_twis!(UARTETWISPI0, TWIS0, SERIAL0);
+impl_uarte!(SERIAL0, UARTE0, SERIAL0);
+impl_spim!(SERIAL0, SPIM0, SERIAL0);
+impl_spis!(SERIAL0, SPIS0, SERIAL0);
+impl_twim!(SERIAL0, TWIM0, SERIAL0);
+impl_twis!(SERIAL0, TWIS0, SERIAL0);
 
 impl_timer!(TIMER0, TIMER0, TIMER0);
 impl_timer!(TIMER1, TIMER1, TIMER1);
 impl_timer!(TIMER2, TIMER2, TIMER2);
+
+impl_rng!(RNG, RNG, RNG);
 
 impl_pin!(P0_00, 0, 0);
 impl_pin!(P0_01, 0, 1);
