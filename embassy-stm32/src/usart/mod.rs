@@ -24,6 +24,7 @@ use crate::pac::usart::Lpuart as Regs;
 use crate::pac::usart::Usart as Regs;
 use crate::pac::usart::{regs, vals};
 use crate::time::Hertz;
+use crate::timeout::{Timeout, TimeoutError};
 use crate::{interrupt, peripherals, Peripheral};
 
 /// Interrupt handler.
@@ -120,6 +121,10 @@ pub struct Config {
     /// Set this to true to swap the RX and TX pins.
     #[cfg(any(usart_v3, usart_v4))]
     pub swap_rx_tx: bool,
+
+    /// Timeout.
+    #[cfg(feature = "time")]
+    pub timeout: embassy_time::Duration,
 }
 
 impl Default for Config {
@@ -135,6 +140,8 @@ impl Default for Config {
             assume_noise_free: false,
             #[cfg(any(usart_v3, usart_v4))]
             swap_rx_tx: false,
+            #[cfg(feature = "time")]
+            timeout: embassy_time::Duration::from_millis(1000),
         }
     }
 }
@@ -154,6 +161,14 @@ pub enum Error {
     Parity,
     /// Buffer too large for DMA
     BufferTooLong,
+    /// Timeout
+    Timeout,
+}
+
+impl From<TimeoutError> for Error {
+    fn from(_: TimeoutError) -> Self {
+        Error::Timeout
+    }
 }
 
 enum ReadCompletionEvent {
@@ -171,6 +186,8 @@ pub struct Uart<'d, T: BasicInstance, TxDma = NoDma, RxDma = NoDma> {
 pub struct UartTx<'d, T: BasicInstance, TxDma = NoDma> {
     phantom: PhantomData<&'d mut T>,
     tx_dma: PeripheralRef<'d, TxDma>,
+    #[cfg(feature = "time")]
+    timeout: embassy_time::Duration,
 }
 
 pub struct UartRx<'d, T: BasicInstance, RxDma = NoDma> {
@@ -179,6 +196,8 @@ pub struct UartRx<'d, T: BasicInstance, RxDma = NoDma> {
     detect_previous_overrun: bool,
     #[cfg(any(usart_v1, usart_v2))]
     buffered_sr: stm32_metapac::usart::regs::Sr,
+    #[cfg(feature = "time")]
+    timeout: embassy_time::Duration,
 }
 
 impl<'d, T: BasicInstance, TxDma> UartTx<'d, T, TxDma> {
@@ -234,9 +253,19 @@ impl<'d, T: BasicInstance, TxDma> UartTx<'d, T, TxDma> {
         Self {
             tx_dma,
             phantom: PhantomData,
+            #[cfg(feature = "time")]
+            timeout: config.timeout,
         }
     }
 
+    fn timeout(&self) -> Timeout {
+        Timeout {
+            #[cfg(feature = "time")]
+            deadline: embassy_time::Instant::now() + self.timeout,
+        }
+    }
+
+    /// Initiate an asynchronous UART write
     pub async fn write(&mut self, buffer: &[u8]) -> Result<(), Error>
     where
         TxDma: crate::usart::TxDma<T>,
@@ -254,17 +283,23 @@ impl<'d, T: BasicInstance, TxDma> UartTx<'d, T, TxDma> {
     }
 
     pub fn blocking_write(&mut self, buffer: &[u8]) -> Result<(), Error> {
+        let timeout = self.timeout();
         let r = T::regs();
         for &b in buffer {
-            while !sr(r).read().txe() {}
+            while !sr(r).read().txe() {
+                timeout.check()?;
+            }
             unsafe { tdr(r).write_volatile(b) };
         }
         Ok(())
     }
 
     pub fn blocking_flush(&mut self) -> Result<(), Error> {
+        let timeout = self.timeout();
         let r = T::regs();
-        while !sr(r).read().tc() {}
+        while !sr(r).read().tc() {
+            timeout.check()?;
+        }
         Ok(())
     }
 }
@@ -331,6 +366,15 @@ impl<'d, T: BasicInstance, RxDma> UartRx<'d, T, RxDma> {
             detect_previous_overrun: config.detect_previous_overrun,
             #[cfg(any(usart_v1, usart_v2))]
             buffered_sr: stm32_metapac::usart::regs::Sr(0),
+            #[cfg(feature = "time")]
+            timeout: config.timeout,
+        }
+    }
+
+    fn timeout(&self) -> Timeout {
+        Timeout {
+            #[cfg(feature = "time")]
+            deadline: embassy_time::Instant::now() + self.timeout,
         }
     }
 
@@ -406,9 +450,12 @@ impl<'d, T: BasicInstance, RxDma> UartRx<'d, T, RxDma> {
     }
 
     pub fn blocking_read(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
+        let timeout = self.timeout();
         let r = T::regs();
         for b in buffer {
-            while !self.check_rx_flags()? {}
+            while !self.check_rx_flags()? {
+                timeout.check()?;
+            }
             unsafe { *b = rdr(r).read_volatile() }
         }
         Ok(())
@@ -987,6 +1034,7 @@ mod eh1 {
                 Self::Noise => embedded_hal_nb::serial::ErrorKind::Noise,
                 Self::Overrun => embedded_hal_nb::serial::ErrorKind::Overrun,
                 Self::Parity => embedded_hal_nb::serial::ErrorKind::Parity,
+                Self::Timeout => embedded_hal_nb::serial::ErrorKind::Other,
                 Self::BufferTooLong => embedded_hal_nb::serial::ErrorKind::Other,
             }
         }
