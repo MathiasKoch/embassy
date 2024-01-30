@@ -795,6 +795,8 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
             tx: UartTx {
                 tx_dma,
                 phantom: PhantomData,
+                #[cfg(feature = "time")]
+                timeout: config.timeout,
             },
             rx: UartRx {
                 _peri: peri,
@@ -802,6 +804,8 @@ impl<'d, T: BasicInstance, TxDma, RxDma> Uart<'d, T, TxDma, RxDma> {
                 detect_previous_overrun: config.detect_previous_overrun,
                 #[cfg(any(usart_v1, usart_v2))]
                 buffered_sr: stm32_metapac::usart::regs::Sr(0),
+                #[cfg(feature = "time")]
+                timeout: config.timeout,
             },
         }
     }
