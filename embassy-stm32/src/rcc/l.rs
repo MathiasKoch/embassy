@@ -159,6 +159,13 @@ pub(crate) unsafe fn init(config: Config) {
         while RCC.cfgr().read().sws() != Sysclk::MSI {}
     }
 
+    #[cfg(stm32wl)]
+    {
+        // Set max latency
+        FLASH.acr().modify(|w| w.set_prften(true));
+        FLASH.acr().modify(|w| w.set_latency(2));
+    }
+
     // Set voltage scale
     #[cfg(any(stm32l0, stm32l1))]
     {
@@ -412,6 +419,9 @@ pub(crate) unsafe fn init(config: Config) {
         pllsai2_q: pllsai2.q,
         #[cfg(any(stm32l47x, stm32l48x, stm32l49x, stm32l4ax, rcc_l4plus, stm32l5))]
         pllsai2_r: pllsai2.r,
+
+        #[cfg(dsihost)]
+        dsi_phy: None, // DSI PLL clock not supported, don't call `RccPeripheral::frequency()` in the drivers
 
         rtc: rtc,
 
