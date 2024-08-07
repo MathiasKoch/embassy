@@ -48,7 +48,7 @@ impl Lines {
         // if let Some((mask, val)) = self.hangup_mask.get() {
         if !self.rx.get().0.dv() {
             if !self.hangup.get() {
-                warn!("HANGUP detected!");
+                trace!("HANGUP detected!");
                 // self.hangup_waker.wake();
             }
             // self.hangup.set(true);
@@ -153,7 +153,9 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
 
             // Read response
             for _ in 0..5 {
-                let header = frame::RxHeader::read(&mut port_r).await.unwrap();
+                let Ok(header) = frame::RxHeader::read(&mut port_r).await else {
+                    continue;
+                };
                 trace!("RX header {:?}", header);
 
                 if header.frame_type == FrameType::Ua && header.id() == id {
@@ -215,7 +217,7 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                             if (control, brk) != line_tx_sent[i] {
                                 line_tx_sent[i] = (control, brk);
 
-                                info!("Sending new TX signals");
+                                trace!("Sending new TX signals");
 
                                 let frame = frame::Uih {
                                     id: 0,
@@ -234,7 +236,7 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                             if (control, brk) != line_rx_sent[i] {
                                 line_rx_sent[i] = (control, brk);
 
-                                info!("Acknowledging new RX signals");
+                                trace!("Acknowledging new RX signals");
 
                                 let frame = frame::Uih {
                                     id: 0,
@@ -255,7 +257,9 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
 
         let rx_fut = async {
             loop {
-                let header = frame::RxHeader::read(&mut port_r).await.unwrap();
+                let Ok(header) = frame::RxHeader::read(&mut port_r).await else {
+                    continue;
+                };
                 trace!("{:?}", header);
 
                 if header.len > 0 {
@@ -284,7 +288,7 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                                         (new_control, new_brk)
                                     );
 
-                                    // Modem is telling us something abount
+                                    // Modem is telling us something about
                                     // channel `msc.dlci`.
                                     //
                                     // We need to ack this message by sending
@@ -323,7 +327,7 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                                     command_type
                                 );
                             } else {
-                                debug!("Command acknowledged by the mobile station");
+                                trace!("Command acknowledged by the mobile station");
                             }
                         }
                     } else {
