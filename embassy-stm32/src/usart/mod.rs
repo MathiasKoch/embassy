@@ -14,7 +14,7 @@ use embassy_sync::waitqueue::AtomicWaker;
 use futures_util::future::{select, Either};
 
 use crate::dma::ChannelAndRequest;
-use crate::gpio::{AfType, AnyPin, OutputType, Pull, SealedPin as _, Speed};
+use crate::gpio::{self, AfType, AnyPin, OutputType, Pull, SealedPin as _, Speed};
 use crate::interrupt::typelevel::Interrupt as _;
 use crate::interrupt::{self, Interrupt, InterruptExt};
 use crate::mode::{Async, Blocking, Mode};
@@ -211,6 +211,30 @@ impl Default for Config {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+/// Half duplex IO mode
+pub enum HalfDuplexConfig {
+    /// Push pull allows for faster baudrates, may require series resistor
+    PushPull,
+    /// Open drain output using external pull up resistor
+    OpenDrainExternal,
+    #[cfg(not(gpio_v1))]
+    /// Open drain output using internal pull up resistor
+    OpenDrainInternal,
+}
+
+impl HalfDuplexConfig {
+    fn af_type(self) -> gpio::AfType {
+        match self {
+            HalfDuplexConfig::PushPull => AfType::output(OutputType::PushPull, Speed::Medium),
+            HalfDuplexConfig::OpenDrainExternal => AfType::output(OutputType::OpenDrain, Speed::Medium),
+            #[cfg(not(gpio_v1))]
+            HalfDuplexConfig::OpenDrainInternal => AfType::output_pull(OutputType::OpenDrain, Speed::Medium, Pull::Up),
+        }
+    }
+}
+
 /// Serial error
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -371,9 +395,12 @@ impl<'d> UartTx<'d, Async> {
     pub async fn write(&mut self, buffer: &[u8]) -> Result<(), Error> {
         let r = self.info.regs;
 
-        // Disable Receiver for Half-Duplex mode
-        if r.cr3().read().hdsel() {
-            r.cr1().modify(|reg| reg.set_re(false));
+        // Enable Transmitter and disable Receiver for Half-Duplex mode
+        let mut cr1 = r.cr1().read();
+        if r.cr3().read().hdsel() && !cr1.te() {
+            cr1.set_te(true);
+            cr1.set_re(false);
+            r.cr1().write_value(cr1);
         }
 
         let ch = self.tx_dma.as_mut().unwrap();
@@ -474,9 +501,12 @@ impl<'d, M: Mode> UartTx<'d, M> {
     pub fn blocking_write(&mut self, buffer: &[u8]) -> Result<(), Error> {
         let r = self.info.regs;
 
-        // Disable Receiver for Half-Duplex mode
-        if r.cr3().read().hdsel() {
-            r.cr1().modify(|reg| reg.set_re(false));
+        // Enable Transmitter and disable Receiver for Half-Duplex mode
+        let mut cr1 = r.cr1().read();
+        if r.cr3().read().hdsel() && !cr1.te() {
+            cr1.set_te(true);
+            cr1.set_re(false);
+            r.cr1().write_value(cr1);
         }
 
         for &b in buffer {
@@ -490,6 +520,11 @@ impl<'d, M: Mode> UartTx<'d, M> {
     pub fn blocking_flush(&mut self) -> Result<(), Error> {
         blocking_flush(self.info)
     }
+
+    /// Send break character
+    pub fn send_break(&self) {
+        send_break(&self.info.regs);
+    }
 }
 
 fn blocking_flush(info: &Info) -> Result<(), Error> {
@@ -502,6 +537,21 @@ fn blocking_flush(info: &Info) -> Result<(), Error> {
     }
 
     Ok(())
+}
+
+/// Send break character
+pub fn send_break(regs: &Regs) {
+    // Busy wait until previous break has been sent
+    #[cfg(any(usart_v1, usart_v2))]
+    while regs.cr1().read().sbk() {}
+    #[cfg(any(usart_v3, usart_v4))]
+    while regs.isr().read().sbkf() {}
+
+    // Send break right after completing the current character transmission
+    #[cfg(any(usart_v1, usart_v2))]
+    regs.cr1().modify(|w| w.set_sbk(true));
+    #[cfg(any(usart_v3, usart_v4))]
+    regs.rqr().write(|w| w.set_sbkrq(true));
 }
 
 impl<'d> UartRx<'d, Async> {
@@ -561,8 +611,9 @@ impl<'d> UartRx<'d, Async> {
     ) -> Result<ReadCompletionEvent, Error> {
         let r = self.info.regs;
 
-        // Call flush for Half-Duplex mode. It prevents reading of bytes which have just been written.
-        if r.cr3().read().hdsel() {
+        // Call flush for Half-Duplex mode if some bytes were written and flush was not called.
+        // It prevents reading of bytes which have just been written.
+        if r.cr3().read().hdsel() && r.cr1().read().te() {
             blocking_flush(self.info)?;
         }
 
@@ -898,8 +949,9 @@ impl<'d, M: Mode> UartRx<'d, M> {
     pub fn blocking_read(&mut self, buffer: &mut [u8]) -> Result<(), Error> {
         let r = self.info.regs;
 
-        // Call flush for Half-Duplex mode. It prevents reading of bytes which have just been written.
-        if r.cr3().read().hdsel() {
+        // Call flush for Half-Duplex mode if some bytes were written and flush was not called.
+        // It prevents reading of bytes which have just been written.
+        if r.cr3().read().hdsel() && r.cr1().read().te() {
             blocking_flush(self.info)?;
         }
 
@@ -1021,8 +1073,9 @@ impl<'d> Uart<'d, Async> {
     /// (when it is available for your chip). There is no functional difference between these methods, as both
     /// allow bidirectional communication.
     ///
-    /// The pin is always released when no data is transmitted. Thus, it acts as a standard
-    /// I/O in idle or in reception.
+    /// The TX pin is always released when no data is transmitted. Thus, it acts as a standard
+    /// I/O in idle or in reception. It means that the I/O must be configured so that TX is
+    /// configured as alternate function open-drain with an external pull-up
     /// Apart from this, the communication protocol is similar to normal USART mode. Any conflict
     /// on the line must be managed by software (for instance by using a centralized arbiter).
     #[doc(alias("HDSEL"))]
@@ -1033,6 +1086,7 @@ impl<'d> Uart<'d, Async> {
         tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
         rx_dma: impl Peripheral<P = impl RxDma<T>> + 'd,
         mut config: Config,
+        half_duplex: HalfDuplexConfig,
     ) -> Result<Self, ConfigError> {
         #[cfg(not(any(usart_v1, usart_v2)))]
         {
@@ -1043,7 +1097,7 @@ impl<'d> Uart<'d, Async> {
         Self::new_inner(
             peri,
             None,
-            new_pin!(tx, AfType::output(OutputType::PushPull, Speed::Medium)),
+            new_pin!(tx, half_duplex.af_type()),
             None,
             None,
             None,
@@ -1071,6 +1125,7 @@ impl<'d> Uart<'d, Async> {
         tx_dma: impl Peripheral<P = impl TxDma<T>> + 'd,
         rx_dma: impl Peripheral<P = impl RxDma<T>> + 'd,
         mut config: Config,
+        half_duplex: HalfDuplexConfig,
     ) -> Result<Self, ConfigError> {
         config.swap_rx_tx = true;
         config.half_duplex = true;
@@ -1079,7 +1134,7 @@ impl<'d> Uart<'d, Async> {
             peri,
             None,
             None,
-            new_pin!(rx, AfType::output(OutputType::PushPull, Speed::Medium)),
+            new_pin!(rx, half_duplex.af_type()),
             None,
             None,
             new_dma!(tx_dma),
@@ -1184,6 +1239,7 @@ impl<'d> Uart<'d, Blocking> {
         peri: impl Peripheral<P = T> + 'd,
         tx: impl Peripheral<P = impl TxPin<T>> + 'd,
         mut config: Config,
+        half_duplex: HalfDuplexConfig,
     ) -> Result<Self, ConfigError> {
         #[cfg(not(any(usart_v1, usart_v2)))]
         {
@@ -1194,7 +1250,7 @@ impl<'d> Uart<'d, Blocking> {
         Self::new_inner(
             peri,
             None,
-            new_pin!(tx, AfType::output(OutputType::PushPull, Speed::Medium)),
+            new_pin!(tx, half_duplex.af_type()),
             None,
             None,
             None,
@@ -1219,6 +1275,7 @@ impl<'d> Uart<'d, Blocking> {
         peri: impl Peripheral<P = T> + 'd,
         rx: impl Peripheral<P = impl RxPin<T>> + 'd,
         mut config: Config,
+        half_duplex: HalfDuplexConfig,
     ) -> Result<Self, ConfigError> {
         config.swap_rx_tx = true;
         config.half_duplex = true;
@@ -1227,7 +1284,7 @@ impl<'d> Uart<'d, Blocking> {
             peri,
             None,
             None,
-            new_pin!(rx, AfType::output(OutputType::PushPull, Speed::Medium)),
+            new_pin!(rx, half_duplex.af_type()),
             None,
             None,
             None,
@@ -1327,6 +1384,11 @@ impl<'d, M: Mode> Uart<'d, M> {
     /// transmitting and receiving.
     pub fn split(self) -> (UartTx<'d, M>, UartRx<'d, M>) {
         (self.tx, self.rx)
+    }
+
+    /// Send break character
+    pub fn send_break(&self) {
+        self.tx.send_break();
     }
 }
 
@@ -1481,10 +1543,19 @@ fn configure(
     r.cr1().write(|w| {
         // enable uart
         w.set_ue(true);
-        // enable transceiver
-        w.set_te(enable_tx);
-        // enable receiver
-        w.set_re(enable_rx);
+
+        if config.half_duplex {
+            // The te and re bits will be set by write, read and flush methods.
+            // Receiver should be enabled by default for Half-Duplex.
+            w.set_te(false);
+            w.set_re(true);
+        } else {
+            // enable transceiver
+            w.set_te(enable_tx);
+            // enable receiver
+            w.set_re(enable_rx);
+        }
+
         // configure word size
         // if using odd or even parity it must be configured to 9bits
         w.set_m0(if config.parity != Parity::ParityNone {

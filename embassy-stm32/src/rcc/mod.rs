@@ -48,11 +48,22 @@ pub(crate) static mut REFCOUNT_STOP1: u32 = 0;
 /// May be read without a critical section
 pub(crate) static mut REFCOUNT_STOP2: u32 = 0;
 
+#[cfg(not(feature = "_dual-core"))]
 /// Frozen clock frequencies
 ///
 /// The existence of this value indicates that the clock configuration can no longer be changed
 static mut CLOCK_FREQS: MaybeUninit<Clocks> = MaybeUninit::uninit();
 
+#[cfg(feature = "_dual-core")]
+static CLOCK_FREQS_PTR: core::sync::atomic::AtomicPtr<MaybeUninit<Clocks>> =
+    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
+
+#[cfg(feature = "_dual-core")]
+pub(crate) fn set_freqs_ptr(freqs: *mut MaybeUninit<Clocks>) {
+    CLOCK_FREQS_PTR.store(freqs, core::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(not(feature = "_dual-core"))]
 /// Sets the clock frequencies
 ///
 /// Safety: Sets a mutable global.
@@ -61,9 +72,27 @@ pub(crate) unsafe fn set_freqs(freqs: Clocks) {
     CLOCK_FREQS = MaybeUninit::new(freqs);
 }
 
+#[cfg(feature = "_dual-core")]
+/// Sets the clock frequencies
+///
+/// Safety: Sets a mutable global.
+pub(crate) unsafe fn set_freqs(freqs: Clocks) {
+    debug!("rcc: {:?}", freqs);
+    CLOCK_FREQS_PTR
+        .load(core::sync::atomic::Ordering::SeqCst)
+        .write(MaybeUninit::new(freqs));
+}
+
+#[cfg(not(feature = "_dual-core"))]
 /// Safety: Reads a mutable global.
 pub(crate) unsafe fn get_freqs() -> &'static Clocks {
     CLOCK_FREQS.assume_init_ref()
+}
+
+#[cfg(feature = "_dual-core")]
+/// Safety: Reads a mutable global.
+pub(crate) unsafe fn get_freqs() -> &'static Clocks {
+    unwrap!(CLOCK_FREQS_PTR.load(core::sync::atomic::Ordering::SeqCst).as_ref()).assume_init_ref()
 }
 
 pub(crate) trait SealedRccPeripheral {
@@ -138,11 +167,17 @@ impl RccInfo {
     pub(crate) fn enable_and_reset_with_cs(&self, _cs: CriticalSection) {
         if self.refcount_idx_or_0xff != 0xff {
             let refcount_idx = self.refcount_idx_or_0xff as usize;
-            unsafe {
-                crate::_generated::REFCOUNTS[refcount_idx] += 1;
-            }
-            if unsafe { crate::_generated::REFCOUNTS[refcount_idx] } > 1 {
-                return;
+
+            // Use .get_mut instead of []-operator so that we control how bounds checks happen.
+            // Otherwise, core::fmt will be pulled in here in order to format the integer in the
+            // out-of-bounds error.
+            if let Some(refcount) = unsafe { crate::_generated::REFCOUNTS.get_mut(refcount_idx) } {
+                *refcount += 1;
+                if *refcount > 1 {
+                    return;
+                }
+            } else {
+                panic!("refcount_idx out of bounds: {}", refcount_idx)
             }
         }
 
@@ -196,11 +231,17 @@ impl RccInfo {
     pub(crate) fn disable_with_cs(&self, _cs: CriticalSection) {
         if self.refcount_idx_or_0xff != 0xff {
             let refcount_idx = self.refcount_idx_or_0xff as usize;
-            unsafe {
-                crate::_generated::REFCOUNTS[refcount_idx] -= 1;
-            }
-            if unsafe { crate::_generated::REFCOUNTS[refcount_idx] } > 0 {
-                return;
+
+            // Use .get_mut instead of []-operator so that we control how bounds checks happen.
+            // Otherwise, core::fmt will be pulled in here in order to format the integer in the
+            // out-of-bounds error.
+            if let Some(refcount) = unsafe { crate::_generated::REFCOUNTS.get_mut(refcount_idx) } {
+                *refcount -= 1;
+                if *refcount > 0 {
+                    return;
+                }
+            } else {
+                panic!("refcount_idx out of bounds: {}", refcount_idx)
             }
         }
 

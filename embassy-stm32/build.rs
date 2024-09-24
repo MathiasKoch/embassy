@@ -55,7 +55,7 @@ fn main() {
     let mut singletons: Vec<String> = Vec::new();
     for p in METADATA.peripherals {
         if let Some(r) = &p.registers {
-            if r.kind == "adccommon" || r.kind == "sai" || r.kind == "ucpd" {
+            if r.kind == "adccommon" || r.kind == "sai" || r.kind == "ucpd" || r.kind == "otg" {
                 // TODO: should we emit this for all peripherals? if so, we will need a list of all
                 // possible peripherals across all chips, so that we can declare the configs
                 // (replacing the hard-coded list of `peri_*` cfgs below)
@@ -111,6 +111,8 @@ fn main() {
         "peri_sai4",
         "peri_ucpd1",
         "peri_ucpd2",
+        "peri_usb_otg_fs",
+        "peri_usb_otg_hs",
     ]);
     cfgs.declare_all(&["mco", "mco1", "mco2"]);
 
@@ -475,13 +477,21 @@ fn main() {
     }
 
     impl<'a> ClockGen<'a> {
-        fn gen_clock(&mut self, name: &str) -> TokenStream {
+        fn gen_clock(&mut self, peripheral: &str, name: &str) -> TokenStream {
             let clock_name = format_ident!("{}", name.to_ascii_lowercase());
             self.clock_names.insert(name.to_ascii_lowercase());
-            quote!( unsafe { crate::rcc::get_freqs().#clock_name.unwrap() } )
+            quote!(unsafe {
+                unwrap!(
+                    crate::rcc::get_freqs().#clock_name.to_hertz(),
+                    "peripheral '{}' is configured to use the '{}' clock, which is not running. \
+                    Either enable it in 'config.rcc' or change 'config.rcc.mux' to use another clock",
+                    #peripheral,
+                    #name
+                )
+            })
         }
 
-        fn gen_mux(&mut self, mux: &PeripheralRccRegister) -> TokenStream {
+        fn gen_mux(&mut self, peripheral: &str, mux: &PeripheralRccRegister) -> TokenStream {
             let ir = &self.rcc_registers.ir;
             let fieldset_name = mux.register.to_ascii_lowercase();
             let fieldset = ir
@@ -506,9 +516,9 @@ fn main() {
             for v in enumm.variants.iter().filter(|v| v.name != "DISABLE") {
                 let variant_name = format_ident!("{}", v.name);
                 let expr = if let Some(mux) = self.chained_muxes.get(&v.name) {
-                    self.gen_mux(mux)
+                    self.gen_mux(peripheral, mux)
                 } else {
-                    self.gen_clock(v.name)
+                    self.gen_clock(peripheral, v.name)
                 };
                 match_arms.extend(quote! {
                     crate::pac::rcc::vals::#enum_name::#variant_name => #expr,
@@ -586,8 +596,8 @@ fn main() {
             };
 
             let clock_frequency = match &rcc.kernel_clock {
-                PeripheralRccKernelClock::Mux(mux) => clock_gen.gen_mux(mux),
-                PeripheralRccKernelClock::Clock(clock) => clock_gen.gen_clock(clock),
+                PeripheralRccKernelClock::Mux(mux) => clock_gen.gen_mux(p.name, mux),
+                PeripheralRccKernelClock::Clock(clock) => clock_gen.gen_clock(p.name, clock),
             };
 
             // A refcount leak can result if the same field is shared by peripherals with different stop modes
@@ -705,9 +715,10 @@ fn main() {
     g.extend(quote! {
         #[derive(Clone, Copy, Debug)]
         #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        #[repr(C)]
         pub struct Clocks {
             #(
-                pub #clock_idents: Option<crate::time::Hertz>,
+                pub #clock_idents: crate::time::MaybeHertz,
             )*
         }
     });
@@ -724,7 +735,7 @@ fn main() {
                         $($(#[$m])* $k: $v,)*
                     };
                     crate::rcc::set_freqs(crate::rcc::Clocks {
-                        #( #clock_idents: all.#clock_idents, )*
+                        #( #clock_idents: all.#clock_idents.into(), )*
                     });
                 }
             };
@@ -764,7 +775,7 @@ fn main() {
 
     #[rustfmt::skip]
     let signals: HashMap<_, _> = [
-                // (kind, signal) => trait
+        // (kind, signal) => trait
         (("ucpd", "CC1"), quote!(crate::ucpd::Cc1Pin)),
         (("ucpd", "CC2"), quote!(crate::ucpd::Cc2Pin)),
         (("usart", "TX"), quote!(crate::usart::TxPin)),
@@ -1006,6 +1017,9 @@ fn main() {
         (("hrtim", "CHE2"), quote!(crate::hrtim::ChannelEComplementaryPin)),
         (("hrtim", "CHF1"), quote!(crate::hrtim::ChannelFPin)),
         (("hrtim", "CHF2"), quote!(crate::hrtim::ChannelFComplementaryPin)),
+        (("lptim", "CH1"), quote!(crate::lptim::Channel1Pin)),
+        (("lptim", "CH2"), quote!(crate::lptim::Channel2Pin)),
+        (("lptim", "OUT"), quote!(crate::lptim::OutputPin)),
         (("sdmmc", "CK"), quote!(crate::sdmmc::CkPin)),
         (("sdmmc", "CMD"), quote!(crate::sdmmc::CmdPin)),
         (("sdmmc", "D0"), quote!(crate::sdmmc::D0Pin)),
@@ -1178,6 +1192,11 @@ fn main() {
 
     let signals: HashMap<_, _> = [
         // (kind, signal) => trait
+        (("adc", "ADC"), quote!(crate::adc::RxDma)),
+        (("adc", "ADC1"), quote!(crate::adc::RxDma)),
+        (("adc", "ADC2"), quote!(crate::adc::RxDma)),
+        (("adc", "ADC3"), quote!(crate::adc::RxDma)),
+        (("adc", "ADC4"), quote!(crate::adc::RxDma)),
         (("ucpd", "RX"), quote!(crate::ucpd::RxDma)),
         (("ucpd", "TX"), quote!(crate::ucpd::TxDma)),
         (("usart", "RX"), quote!(crate::usart::RxDma)),
@@ -1480,6 +1499,36 @@ fn main() {
         .flat_map(|p| &p.registers)
         .any(|p| p.kind == "dmamux");
 
+    let mut dma_irqs: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+
+    for p in METADATA.peripherals {
+        if let Some(r) = &p.registers {
+            if r.kind == "dma" || r.kind == "bdma" || r.kind == "gpdma" || r.kind == "lpdma" {
+                for irq in p.interrupts {
+                    let ch_name = format!("{}_{}", p.name, irq.signal);
+                    let ch = METADATA.dma_channels.iter().find(|c| c.name == ch_name).unwrap();
+
+                    // Some H7 chips have BDMA1 hardcoded for DFSDM, ie no DMAMUX. It's unsupported, skip it.
+                    if has_dmamux && ch.dmamux.is_none() {
+                        continue;
+                    }
+
+                    dma_irqs.entry(irq.interrupt).or_default().push(ch_name);
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "_dual-core")]
+    let mut dma_ch_to_irq: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+
+    #[cfg(feature = "_dual-core")]
+    for (irq, channels) in &dma_irqs {
+        for channel in channels {
+            dma_ch_to_irq.entry(channel).or_default().push(irq.to_string());
+        }
+    }
+
     for (ch_idx, ch) in METADATA.dma_channels.iter().enumerate() {
         // Some H7 chips have BDMA1 hardcoded for DFSDM, ie no DMAMUX. It's unsupported, skip it.
         if has_dmamux && ch.dmamux.is_none() {
@@ -1488,6 +1537,16 @@ fn main() {
 
         let name = format_ident!("{}", ch.name);
         let idx = ch_idx as u8;
+        #[cfg(feature = "_dual-core")]
+        let irq = {
+            let irq_name = if let Some(x) = &dma_ch_to_irq.get(ch.name) {
+                format_ident!("{}", x.get(0).unwrap())
+            } else {
+                panic!("failed to find dma interrupt")
+            };
+            quote!(crate::pac::Interrupt::#irq_name)
+        };
+
         g.extend(quote!(dma_channel_impl!(#name, #idx);));
 
         let dma = format_ident!("{}", ch.dma);
@@ -1518,6 +1577,7 @@ fn main() {
             None => quote!(),
         };
 
+        #[cfg(not(feature = "_dual-core"))]
         dmas.extend(quote! {
             crate::dma::ChannelInfo {
                 dma: #dma_info,
@@ -1525,30 +1585,19 @@ fn main() {
                 #dmamux
             },
         });
+        #[cfg(feature = "_dual-core")]
+        dmas.extend(quote! {
+            crate::dma::ChannelInfo {
+                dma: #dma_info,
+                num: #ch_num,
+                irq: #irq,
+                #dmamux
+            },
+        });
     }
 
     // ========
     // Generate DMA IRQs.
-
-    let mut dma_irqs: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-
-    for p in METADATA.peripherals {
-        if let Some(r) = &p.registers {
-            if r.kind == "dma" || r.kind == "bdma" || r.kind == "gpdma" {
-                for irq in p.interrupts {
-                    let ch_name = format!("{}_{}", p.name, irq.signal);
-                    let ch = METADATA.dma_channels.iter().find(|c| c.name == ch_name).unwrap();
-
-                    // Some H7 chips have BDMA1 hardcoded for DFSDM, ie no DMAMUX. It's unsupported, skip it.
-                    if has_dmamux && ch.dmamux.is_none() {
-                        continue;
-                    }
-
-                    dma_irqs.entry(irq.interrupt).or_default().push(ch_name);
-                }
-            }
-        }
-    }
 
     let dma_irqs: TokenStream = dma_irqs
         .iter()
