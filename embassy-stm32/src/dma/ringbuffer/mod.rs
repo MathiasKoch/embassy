@@ -252,12 +252,36 @@ impl<'a, W: Word> WritableDmaRingBuffer<'a, W> {
     }
 
     /// Write elements directly to the buffer.
+    ///
+    /// Subsequent writes will overwrite the content of the buffer, so it is not useful to call this more than once.
+    /// Data is aligned towards the end of the buffer.
+    ///
+    /// In case of success, returns the written length, and the empty space in front of the written block.
+    /// Fails if the data to write exceeds the buffer capacity.
     pub fn write_immediate(&mut self, buf: &[W]) -> Result<(usize, usize), Error> {
+        if buf.len() > self.cap() {
+            return Err(Error::Overrun);
+        }
+
+        let start = self.cap() - buf.len();
         for (i, data) in buf.iter().enumerate() {
-            self.write_buf(i, *data)
+            self.write_buf(start + i, *data)
         }
         let written = buf.len().min(self.cap());
         Ok((written, self.cap() - written))
+    }
+
+    /// Wait for any ring buffer write error.
+    pub async fn wait_write_error(&mut self, dma: &mut impl DmaCtrl) -> Result<usize, Error> {
+        poll_fn(|cx| {
+            dma.set_waker(cx.waker());
+
+            match self.len(dma) {
+                Ok(_) => Poll::Pending,
+                Err(e) => Poll::Ready(Err(e)),
+            }
+        })
+        .await
     }
 
     /// Write an exact number of elements to the ringbuffer.

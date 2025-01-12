@@ -100,7 +100,7 @@ impl From<Priority> for pac::dma::vals::Pl {
             Priority::Low => pac::dma::vals::Pl::LOW,
             Priority::Medium => pac::dma::vals::Pl::MEDIUM,
             Priority::High => pac::dma::vals::Pl::HIGH,
-            Priority::VeryHigh => pac::dma::vals::Pl::VERYHIGH,
+            Priority::VeryHigh => pac::dma::vals::Pl::VERY_HIGH,
         }
     }
 }
@@ -112,7 +112,7 @@ impl From<Priority> for pac::bdma::vals::Pl {
             Priority::Low => pac::bdma::vals::Pl::LOW,
             Priority::Medium => pac::bdma::vals::Pl::MEDIUM,
             Priority::High => pac::bdma::vals::Pl::HIGH,
-            Priority::VeryHigh => pac::bdma::vals::Pl::VERYHIGH,
+            Priority::VeryHigh => pac::bdma::vals::Pl::VERY_HIGH,
         }
     }
 }
@@ -138,8 +138,8 @@ mod dma_only {
     impl From<Dir> for vals::Dir {
         fn from(raw: Dir) -> Self {
             match raw {
-                Dir::MemoryToPeripheral => Self::MEMORYTOPERIPHERAL,
-                Dir::PeripheralToMemory => Self::PERIPHERALTOMEMORY,
+                Dir::MemoryToPeripheral => Self::MEMORY_TO_PERIPHERAL,
+                Dir::PeripheralToMemory => Self::PERIPHERAL_TO_MEMORY,
             }
         }
     }
@@ -207,7 +207,7 @@ mod dma_only {
             match value {
                 FifoThreshold::Quarter => vals::Fth::QUARTER,
                 FifoThreshold::Half => vals::Fth::HALF,
-                FifoThreshold::ThreeQuarters => vals::Fth::THREEQUARTERS,
+                FifoThreshold::ThreeQuarters => vals::Fth::THREE_QUARTERS,
                 FifoThreshold::Full => vals::Fth::FULL,
             }
         }
@@ -233,8 +233,8 @@ mod bdma_only {
     impl From<Dir> for vals::Dir {
         fn from(raw: Dir) -> Self {
             match raw {
-                Dir::MemoryToPeripheral => Self::FROMMEMORY,
-                Dir::PeripheralToMemory => Self::FROMPERIPHERAL,
+                Dir::MemoryToPeripheral => Self::FROM_MEMORY,
+                Dir::PeripheralToMemory => Self::FROM_PERIPHERAL,
             }
         }
     }
@@ -828,7 +828,6 @@ impl<'a, W: Word> ReadableRingBuffer<'a, W> {
     /// You must call this after creating it for it to work.
     pub fn start(&mut self) {
         self.channel.start();
-        self.clear();
     }
 
     /// Clear all data in the ring buffer.
@@ -981,7 +980,6 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
     /// You must call this after creating it for it to work.
     pub fn start(&mut self) {
         self.channel.start();
-        self.clear();
     }
 
     /// Clear all data in the ring buffer.
@@ -991,7 +989,6 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
 
     /// Write elements directly to the raw buffer.
     /// This can be used to fill the buffer before starting the DMA transfer.
-    #[allow(dead_code)]
     pub fn write_immediate(&mut self, buf: &[W]) -> Result<(usize, usize), Error> {
         self.ringbuf.write_immediate(buf)
     }
@@ -1006,6 +1003,13 @@ impl<'a, W: Word> WritableRingBuffer<'a, W> {
     pub async fn write_exact(&mut self, buffer: &[W]) -> Result<usize, Error> {
         self.ringbuf
             .write_exact(&mut DmaCtrlImpl(self.channel.reborrow()), buffer)
+            .await
+    }
+
+    /// Wait for any ring buffer write error.
+    pub async fn wait_write_error(&mut self) -> Result<usize, Error> {
+        self.ringbuf
+            .wait_write_error(&mut DmaCtrlImpl(self.channel.reborrow()))
             .await
     }
 

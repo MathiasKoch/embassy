@@ -1,6 +1,6 @@
 //! Trait and implementations for performing VBUS detection.
 
-use core::future::poll_fn;
+use core::future::{poll_fn, Future};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::Poll;
 
@@ -29,14 +29,14 @@ pub trait VbusDetect {
 }
 
 #[cfg(not(feature = "_nrf5340"))]
-type UsbRegIrq = interrupt::typelevel::POWER_CLOCK;
+type UsbRegIrq = interrupt::typelevel::CLOCK_POWER;
 #[cfg(feature = "_nrf5340")]
 type UsbRegIrq = interrupt::typelevel::USBREGULATOR;
 
 #[cfg(not(feature = "_nrf5340"))]
 const USB_REG_PERI: pac::power::Power = pac::POWER;
 #[cfg(feature = "_nrf5340")]
-const USB_REG_PERI: pac::usbregulator::Usbregulator = pac::USBREGULATOR;
+const USB_REG_PERI: pac::usbreg::Usbreg = pac::USBREGULATOR;
 
 /// Interrupt handler.
 pub struct InterruptHandler {
@@ -99,8 +99,8 @@ impl VbusDetect for HardwareVbusDetect {
         regs.usbregstatus().read().vbusdetect()
     }
 
-    async fn wait_power_ready(&mut self) -> Result<(), ()> {
-        poll_fn(move |cx| {
+    fn wait_power_ready(&mut self) -> impl Future<Output = Result<(), ()>> {
+        poll_fn(|cx| {
             POWER_WAKER.register(cx.waker());
             let regs = USB_REG_PERI;
 
@@ -112,7 +112,6 @@ impl VbusDetect for HardwareVbusDetect {
                 Poll::Pending
             }
         })
-        .await
     }
 }
 
@@ -163,7 +162,7 @@ impl VbusDetect for &SoftwareVbusDetect {
         self.usb_detected.load(Ordering::Relaxed)
     }
 
-    async fn wait_power_ready(&mut self) -> Result<(), ()> {
+    fn wait_power_ready(&mut self) -> impl Future<Output = Result<(), ()>> {
         poll_fn(move |cx| {
             POWER_WAKER.register(cx.waker());
 
@@ -175,6 +174,5 @@ impl VbusDetect for &SoftwareVbusDetect {
                 Poll::Pending
             }
         })
-        .await
     }
 }

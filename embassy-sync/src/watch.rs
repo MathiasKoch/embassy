@@ -1,7 +1,7 @@
 //! A synchronization primitive for passing the latest value to **multiple** receivers.
 
 use core::cell::RefCell;
-use core::future::poll_fn;
+use core::future::{poll_fn, Future};
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::task::{Context, Poll};
@@ -310,6 +310,18 @@ impl<M: RawMutex, T: Clone, const N: usize> Watch<M, T, N> {
         }
     }
 
+    /// Create a new `Watch` channel with default data.
+    pub const fn new_with(data: T) -> Self {
+        Self {
+            mutex: Mutex::new(RefCell::new(WatchState {
+                data: Some(data),
+                current_id: 0,
+                wakers: MultiWakerRegistration::new(),
+                receiver_count: 0,
+            })),
+        }
+    }
+
     /// Create a new [`Sender`] for the `Watch`.
     pub fn sender(&self) -> Sender<'_, M, T, N> {
         Sender(Snd::new(self))
@@ -535,8 +547,8 @@ impl<'a, T: Clone, W: WatchBehavior<T> + ?Sized> Rcv<'a, T, W> {
     /// Returns the current value of the `Watch` once it is initialized, marking it as seen.
     ///
     /// **Note**: Futures do nothing unless you `.await` or poll them.
-    pub async fn get(&mut self) -> T {
-        poll_fn(|cx| self.watch.poll_get(&mut self.at_id, cx)).await
+    pub fn get(&mut self) -> impl Future<Output = T> + '_ {
+        poll_fn(|cx| self.watch.poll_get(&mut self.at_id, cx))
     }
 
     /// Tries to get the current value of the `Watch` without waiting, marking it as seen.
