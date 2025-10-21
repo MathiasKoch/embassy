@@ -3,7 +3,7 @@
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::dsihost::{blocking_delay_ms, DsiHost, PacketType};
+use embassy_stm32::dsihost::{DsiHost, PacketType, blocking_delay_ms};
 use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::ltdc::Ltdc;
 use embassy_stm32::pac::dsihost::regs::{Ier0, Ier1};
@@ -211,7 +211,7 @@ async fn main(_spawner: Spawner) {
     const HORIZONTAL_SYNC_ACTIVE: u16 = 4; // ((HSA as u32 * LANE_BYTE_CLK_K_HZ as u32 ) / LCD_CLOCK as u32 ) as u16;
     const HORIZONTAL_BACK_PORCH: u16 = 77; //((HBP as u32  * LANE_BYTE_CLK_K_HZ as u32 ) / LCD_CLOCK as u32) as u16;
     const HORIZONTAL_LINE: u16 = 1982; //(((HACT + HSA + HBP + HFP) as u32  * LANE_BYTE_CLK_K_HZ as u32 ) / LCD_CLOCK as u32 ) as u16; /* Value depending on display orientation choice portrait/landscape */
-                                       // FIXME: Make depend on orientation
+    // FIXME: Make depend on orientation
     const VERTICAL_SYNC_ACTIVE: u16 = VSA;
     const VERTICAL_BACK_PORCH: u16 = VBP;
     const VERTICAL_FRONT_PORCH: u16 = VFP;
@@ -363,20 +363,20 @@ async fn main(_spawner: Spawner) {
     const _PCPOLARITY: bool = false; // LTDC_PCPOLARITY_IPC == 0
 
     const LTDC_DE_POLARITY: Depol = if !DE_POLARITY {
-        Depol::ACTIVELOW
+        Depol::ACTIVE_LOW
     } else {
-        Depol::ACTIVEHIGH
+        Depol::ACTIVE_HIGH
     };
     const LTDC_VS_POLARITY: Vspol = if !VS_POLARITY {
-        Vspol::ACTIVEHIGH
+        Vspol::ACTIVE_HIGH
     } else {
-        Vspol::ACTIVELOW
+        Vspol::ACTIVE_LOW
     };
 
     const LTDC_HS_POLARITY: Hspol = if !HS_POLARITY {
-        Hspol::ACTIVEHIGH
+        Hspol::ACTIVE_HIGH
     } else {
-        Hspol::ACTIVELOW
+        Hspol::ACTIVE_LOW
     };
 
     /* Timing Configuration */
@@ -397,7 +397,7 @@ async fn main(_spawner: Spawner) {
         w.set_hspol(LTDC_HS_POLARITY);
         w.set_vspol(LTDC_VS_POLARITY);
         w.set_depol(LTDC_DE_POLARITY);
-        w.set_pcpol(Pcpol::RISINGEDGE);
+        w.set_pcpol(Pcpol::RISING_EDGE);
     });
 
     // Set Synchronization size
@@ -658,7 +658,7 @@ const NT35510_RASET_LANDSCAPE: &[u8] = &[NT35510_CMD_RASET, 0x00, 0x00, 0x01, 0x
 
 const NT35510_WRITES_26: &[u8] = &[NT35510_CMD_TEEON, 0x00]; // Tear on
 const NT35510_WRITES_27: &[u8] = &[NT35510_CMD_SLPOUT, 0x00]; // Sleep out
-                                                              // 28,29 missing
+// 28,29 missing
 const NT35510_WRITES_30: &[u8] = &[NT35510_CMD_DISPON, 0x00]; // Display on
 
 const NT35510_WRITES_31: &[u8] = &[NT35510_CMD_WRDISBV, 0x7F];

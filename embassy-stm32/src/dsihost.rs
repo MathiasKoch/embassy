@@ -2,19 +2,19 @@
 
 use core::marker::PhantomData;
 
-use embassy_hal_internal::{into_ref, PeripheralRef};
+use embassy_hal_internal::PeripheralType;
 
 //use crate::gpio::{AnyPin, SealedPin};
 use crate::gpio::{AfType, AnyPin, OutputType, Speed};
 use crate::rcc::{self, RccPeripheral};
-use crate::{peripherals, Peripheral};
+use crate::{Peri, peripherals};
 
 /// Performs a busy-wait delay for a specified number of microseconds.
 pub fn blocking_delay_ms(ms: u32) {
     #[cfg(feature = "time")]
     embassy_time::block_for(embassy_time::Duration::from_millis(ms as u64));
     #[cfg(not(feature = "time"))]
-    cortex_m::asm::delay(unsafe { crate::rcc::get_freqs() }.sys.unwrap().0 / 1_000 * ms);
+    cortex_m::asm::delay(unsafe { crate::rcc::get_freqs() }.sys.to_hertz().unwrap().0 / 1_000 * ms);
 }
 
 /// PacketTypes extracted from CubeMX
@@ -69,18 +69,16 @@ impl From<PacketType> for u8 {
 /// DSIHOST driver.
 pub struct DsiHost<'d, T: Instance> {
     _peri: PhantomData<&'d mut T>,
-    _te: PeripheralRef<'d, AnyPin>,
+    _te: Peri<'d, AnyPin>,
 }
 
 impl<'d, T: Instance> DsiHost<'d, T> {
     /// Note: Full-Duplex modes are not supported at this time
-    pub fn new(_peri: impl Peripheral<P = T> + 'd, te: impl Peripheral<P = impl TePin<T>> + 'd) -> Self {
-        into_ref!(te);
-
+    pub fn new(_peri: Peri<'d, T>, te: Peri<'d, impl TePin<T>>) -> Self {
         rcc::enable_and_reset::<T>();
 
         // Set Tearing Enable pin according to CubeMx example
-        te.set_as_af(te.af_num(), AfType::output(OutputType::PushPull, Speed::Low));
+        set_as_af!(te, AfType::output(OutputType::PushPull, Speed::Low));
         /*
                 T::regs().wcr().modify(|w| {
                     w.set_dsien(true);
@@ -88,7 +86,7 @@ impl<'d, T: Instance> DsiHost<'d, T> {
         */
         Self {
             _peri: PhantomData,
-            _te: te.map_into(),
+            _te: te.into(),
         }
     }
 
@@ -412,7 +410,7 @@ trait SealedInstance: crate::rcc::SealedRccPeripheral {
 
 /// DSI instance trait.
 #[allow(private_bounds)]
-pub trait Instance: SealedInstance + RccPeripheral + 'static {}
+pub trait Instance: SealedInstance + PeripheralType + RccPeripheral + 'static {}
 
 pin_trait!(TePin, Instance);
 

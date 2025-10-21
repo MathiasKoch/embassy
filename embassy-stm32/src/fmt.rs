@@ -7,6 +7,28 @@ use core::fmt::{Debug, Display, LowerHex};
 compile_error!("You may not enable both `defmt` and `log` features.");
 
 #[collapse_debuginfo(yes)]
+macro_rules! rcc_assert {
+    ($($x:tt)*) => {
+        {
+            #[cfg(not(feature = "unchecked-overclocking"))]
+            {
+                #[cfg(not(feature = "defmt"))]
+                ::core::assert!($($x)*);
+                #[cfg(feature = "defmt")]
+                ::defmt::assert!($($x)*);
+            }
+            #[cfg(feature = "unchecked-overclocking")]
+            {
+                #[cfg(feature = "log")]
+                ::log::warn!("`rcc_assert!` skipped: `unchecked-overclocking` feature is enabled.");
+                #[cfg(feature = "defmt")]
+                ::defmt::warn!("`rcc_assert!` skipped: `unchecked-overclocking` feature is enabled.");
+            }
+        }
+    };
+}
+
+#[collapse_debuginfo(yes)]
 macro_rules! assert {
     ($($x:tt)*) => {
         {
@@ -90,19 +112,15 @@ macro_rules! todo {
     };
 }
 
-#[cfg(not(feature = "defmt"))]
 #[collapse_debuginfo(yes)]
 macro_rules! unreachable {
     ($($x:tt)*) => {
-        ::core::unreachable!($($x)*)
-    };
-}
-
-#[cfg(feature = "defmt")]
-#[collapse_debuginfo(yes)]
-macro_rules! unreachable {
-    ($($x:tt)*) => {
-        ::defmt::unreachable!($($x)*)
+        {
+            #[cfg(not(feature = "defmt"))]
+            ::core::unreachable!($($x)*);
+            #[cfg(feature = "defmt")]
+            ::defmt::unreachable!($($x)*);
+        }
     };
 }
 

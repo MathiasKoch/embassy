@@ -1,7 +1,7 @@
 //! Configuration for FDCAN Module
 // Note: This file is copied and modified from fdcan crate by Richard Meadows
 
-use core::num::{NonZeroU16, NonZeroU8};
+use core::num::{NonZeroU8, NonZeroU16};
 
 /// Configures the bit timings.
 ///
@@ -328,11 +328,15 @@ pub struct FdCanConfig {
     ///
     /// Automatic retransmission is enabled by default.
     pub automatic_retransmit: bool,
-    /// Enabled or disables the pausing between transmissions
+    /// The transmit pause feature is intended for use in CAN systems where the CAN message
+    /// identifiers are permanently specified to specific values and cannot easily be changed.
     ///
-    /// This feature looses up burst transmissions coming from a single node and it protects against
-    /// "babbling idiot" scenarios where the application program erroneously requests too many
-    /// transmissions.
+    /// These message identifiers can have a higher CAN arbitration priority than other defined
+    /// messages, while in a specific application their relative arbitration priority must be inverse.
+    ///
+    /// This may lead to a case where one ECU sends a burst of CAN messages that cause
+    /// another ECU CAN messages to be delayed because that other messages have a lower
+    /// CAN arbitration priority.
     pub transmit_pause: bool,
     /// Enabled or disables the pausing between transmissions
     ///

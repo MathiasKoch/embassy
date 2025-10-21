@@ -65,8 +65,7 @@ macro_rules! ioctl {
         };
         $self.ioctl(&mut msg).await?;
         #[allow(unused_mut)]
-        let Some(proto::CtrlMsgPayload::$resp_variant(mut $resp)) = msg.payload
-        else {
+        let Some(proto::CtrlMsgPayload::$resp_variant(mut $resp)) = msg.payload else {
             warn!("unexpected response variant");
             return Err(Error::Internal);
         };
@@ -120,7 +119,7 @@ impl<'a> Control<'a> {
             pwd: unwrap!(String::try_from(password)),
             bssid: String::new(),
             listen_interval: 3,
-            is_wpa3_supported: false,
+            is_wpa3_supported: true,
         };
         ioctl!(self, ReqConnectAp, RespConnectAp, req, resp);
         self.state_ch.set_link_state(LinkState::Up);

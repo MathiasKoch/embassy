@@ -1,6 +1,6 @@
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
-use crate::pac::common::{Reg, RW};
+use crate::pac::common::{RW, Reg};
 pub use crate::pac::rcc::vals::Rtcsel as RtcClockSource;
 use crate::time::Hertz;
 
@@ -16,9 +16,13 @@ pub enum LseMode {
     Bypass,
 }
 
+#[derive(Clone, Copy)]
 pub struct LseConfig {
     pub frequency: Hertz,
     pub mode: LseMode,
+    /// If peripherals other than RTC/TAMP or RCC functions need the lse this bit must be set
+    #[cfg(any(rcc_l5, rcc_u5, rcc_wle, rcc_wl5, rcc_wba))]
+    pub peripherals_clocked: bool,
 }
 
 #[allow(dead_code)]
@@ -41,16 +45,16 @@ impl From<LseDrive> for crate::pac::rcc::vals::Lsedrv {
         match value {
             #[cfg(not(stm32h5))] // ES0565: LSE Low drive mode is not functional
             LseDrive::Low => Lsedrv::LOW,
-            LseDrive::MediumLow => Lsedrv::MEDIUMLOW,
-            LseDrive::MediumHigh => Lsedrv::MEDIUMHIGH,
+            LseDrive::MediumLow => Lsedrv::MEDIUM_LOW,
+            LseDrive::MediumHigh => Lsedrv::MEDIUM_HIGH,
             LseDrive::High => Lsedrv::HIGH,
         }
     }
 }
 
-#[cfg(not(any(rtc_v2l0, rtc_v2l1, stm32c0)))]
+#[cfg(not(any(rtc_v2_l0, rtc_v2_l1, stm32c0)))]
 type Bdcr = crate::pac::rcc::regs::Bdcr;
-#[cfg(any(rtc_v2l0, rtc_v2l1))]
+#[cfg(any(rtc_v2_l0, rtc_v2_l1))]
 type Bdcr = crate::pac::rcc::regs::Csr;
 #[cfg(any(stm32c0))]
 type Bdcr = crate::pac::rcc::regs::Csr1;
@@ -72,14 +76,15 @@ fn unlock() {
 }
 
 fn bdcr() -> Reg<Bdcr, RW> {
-    #[cfg(any(rtc_v2l0, rtc_v2l1))]
+    #[cfg(any(rtc_v2_l0, rtc_v2_l1))]
     return crate::pac::RCC.csr();
-    #[cfg(not(any(rtc_v2l0, rtc_v2l1, stm32c0)))]
+    #[cfg(not(any(rtc_v2_l0, rtc_v2_l1, stm32c0)))]
     return crate::pac::RCC.bdcr();
     #[cfg(any(stm32c0))]
     return crate::pac::RCC.csr1();
 }
 
+#[derive(Clone, Copy)]
 pub struct LsConfig {
     pub rtc: RtcClockSource,
     pub lsi: bool,
@@ -87,12 +92,25 @@ pub struct LsConfig {
 }
 
 impl LsConfig {
+    /// Creates an [`LsConfig`] using the LSI when possible.
+    pub const fn new() -> Self {
+        // on L5, just the fact that LSI is enabled makes things crash.
+        // TODO: investigate.
+
+        #[cfg(not(stm32l5))]
+        return Self::default_lsi();
+        #[cfg(stm32l5)]
+        return Self::off();
+    }
+
     pub const fn default_lse() -> Self {
         Self {
             rtc: RtcClockSource::LSE,
             lse: Some(LseConfig {
                 frequency: Hertz(32_768),
                 mode: LseMode::Oscillator(LseDrive::MediumHigh),
+                #[cfg(any(rcc_l5, rcc_u5, rcc_wle, rcc_wl5, rcc_wba))]
+                peripherals_clocked: false,
             }),
             lsi: false,
         }
@@ -117,13 +135,7 @@ impl LsConfig {
 
 impl Default for LsConfig {
     fn default() -> Self {
-        // on L5, just the fact that LSI is enabled makes things crash.
-        // TODO: investigate.
-
-        #[cfg(not(stm32l5))]
-        return Self::default_lsi();
-        #[cfg(stm32l5)]
-        return Self::off();
+        Self::new()
     }
 }
 
@@ -146,6 +158,15 @@ impl LsConfig {
             },
             None => (false, false, None),
         };
+        #[cfg(any(rcc_l5, rcc_u5, rcc_wle, rcc_wl5, rcc_wba))]
+        let lse_sysen = if let Some(lse) = self.lse {
+            Some(lse.peripherals_clocked)
+        } else {
+            None
+        };
+        #[cfg(rcc_u0)]
+        let lse_sysen = Some(lse_en);
+
         _ = lse_drv; // not all chips have it.
 
         // Disable backup domain write protection
@@ -186,6 +207,10 @@ impl LsConfig {
         }
         ok &= reg.lseon() == lse_en;
         ok &= reg.lsebyp() == lse_byp;
+        #[cfg(any(rcc_l5, rcc_u5, rcc_wle, rcc_wl5, rcc_wba, rcc_u0))]
+        if let Some(lse_sysen) = lse_sysen {
+            ok &= reg.lsesysen() == lse_sysen;
+        }
         #[cfg(not(any(rcc_f1, rcc_f1cl, rcc_f100, rcc_f2, rcc_f4, rcc_f410, rcc_l1)))]
         if let Some(lse_drv) = lse_drv {
             ok &= reg.lsedrv() == lse_drv.into();
@@ -233,11 +258,22 @@ impl LsConfig {
             });
 
             while !bdcr().read().lserdy() {}
+
+            #[cfg(any(rcc_l5, rcc_u5, rcc_wle, rcc_wl5, rcc_wba, rcc_u0))]
+            if let Some(lse_sysen) = lse_sysen {
+                bdcr().modify(|w| {
+                    w.set_lsesysen(lse_sysen);
+                });
+
+                if lse_sysen {
+                    while !bdcr().read().lsesysrdy() {}
+                }
+            }
         }
 
         if self.rtc != RtcClockSource::DISABLE {
             bdcr().modify(|w| {
-                #[cfg(any(rtc_v2h7, rtc_v2l4, rtc_v2wb, rtc_v3, rtc_v3u5))]
+                #[cfg(any(rtc_v2_h7, rtc_v2_l4, rtc_v2_wb, rtc_v3_base, rtc_v3_u5))]
                 assert!(!w.lsecsson(), "RTC is not compatible with LSE CSS, yet.");
 
                 #[cfg(not(rcc_wba))]

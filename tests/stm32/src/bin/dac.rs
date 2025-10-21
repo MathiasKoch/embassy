@@ -12,7 +12,6 @@ use defmt::assert;
 use embassy_executor::Spawner;
 use embassy_stm32::adc::Adc;
 use embassy_stm32::dac::{DacCh1, Value};
-use embassy_stm32::dma::NoDma;
 use embassy_time::Timer;
 use micromath::F32Ext;
 use {defmt_rtt as _, panic_probe as _};
@@ -20,14 +19,14 @@ use {defmt_rtt as _, panic_probe as _};
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     // Initialize the board and obtain a Peripherals instance
-    let p: embassy_stm32::Peripherals = embassy_stm32::init(config());
+    let p: embassy_stm32::Peripherals = init();
 
     let adc = peri!(p, ADC);
     let dac = peri!(p, DAC);
     let dac_pin = peri!(p, DAC_PIN);
     let mut adc_pin = unsafe { core::ptr::read(&dac_pin) };
 
-    let mut dac = DacCh1::new(dac, NoDma, dac_pin);
+    let mut dac = DacCh1::new_blocking(dac, dac_pin);
     let mut adc = Adc::new(adc);
 
     #[cfg(feature = "stm32h755zi")]

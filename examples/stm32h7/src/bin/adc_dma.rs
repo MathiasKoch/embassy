@@ -3,12 +3,12 @@
 
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::adc::{Adc, AdcChannel as _, SampleTime};
 use embassy_stm32::Config;
+use embassy_stm32::adc::{Adc, AdcChannel as _, SampleTime};
 use embassy_time::Timer;
 use {defmt_rtt as _, panic_probe as _};
 
-#[link_section = ".ram_d3"]
+#[unsafe(link_section = ".ram_d3")]
 static mut DMA_BUF: [u16; 2] = [0; 2];
 
 #[embassy_executor::main]
@@ -57,7 +57,7 @@ async fn main(_spawner: Spawner) {
 
     loop {
         adc.read(
-            &mut dma,
+            dma.reborrow(),
             [
                 (&mut vrefint_channel, SampleTime::CYCLES387_5),
                 (&mut pc0, SampleTime::CYCLES810_5),

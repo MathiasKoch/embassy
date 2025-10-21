@@ -2,34 +2,36 @@
 
 #![macro_use]
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{Ordering, compiler_fence};
 
-use embassy_hal_internal::{into_ref, PeripheralRef};
+use embassy_hal_internal::{Peri, PeripheralType};
 
-use crate::gpio::{convert_drive, AnyPin, OutputDrive, Pin as GpioPin, PselBits, SealedPin as _};
+use crate::gpio::{AnyPin, DISCONNECTED, OutputDrive, Pin as GpioPin, PselBits, SealedPin as _, convert_drive};
+use crate::pac::gpio::vals as gpiovals;
+use crate::pac::pwm::vals;
 use crate::ppi::{Event, Task};
 use crate::util::slice_in_ram_or;
-use crate::{interrupt, pac, Peripheral};
+use crate::{interrupt, pac};
 
 /// SimplePwm is the traditional pwm interface you're probably used to, allowing
 /// to simply set a duty cycle across up to four channels.
-pub struct SimplePwm<'d, T: Instance> {
-    _peri: PeripheralRef<'d, T>,
+pub struct SimplePwm<'d> {
+    r: pac::pwm::Pwm,
     duty: [u16; 4],
-    ch0: Option<PeripheralRef<'d, AnyPin>>,
-    ch1: Option<PeripheralRef<'d, AnyPin>>,
-    ch2: Option<PeripheralRef<'d, AnyPin>>,
-    ch3: Option<PeripheralRef<'d, AnyPin>>,
+    ch0: Option<Peri<'d, AnyPin>>,
+    ch1: Option<Peri<'d, AnyPin>>,
+    ch2: Option<Peri<'d, AnyPin>>,
+    ch3: Option<Peri<'d, AnyPin>>,
 }
 
 /// SequencePwm allows you to offload the updating of a sequence of duty cycles
 /// to up to four channels, as well as repeat that sequence n times.
-pub struct SequencePwm<'d, T: Instance> {
-    _peri: PeripheralRef<'d, T>,
-    ch0: Option<PeripheralRef<'d, AnyPin>>,
-    ch1: Option<PeripheralRef<'d, AnyPin>>,
-    ch2: Option<PeripheralRef<'d, AnyPin>>,
-    ch3: Option<PeripheralRef<'d, AnyPin>>,
+pub struct SequencePwm<'d> {
+    r: pac::pwm::Pwm,
+    ch0: Option<Peri<'d, AnyPin>>,
+    ch1: Option<Peri<'d, AnyPin>>,
+    ch2: Option<Peri<'d, AnyPin>>,
+    ch3: Option<Peri<'d, AnyPin>>,
 }
 
 /// PWM error
@@ -49,134 +51,130 @@ const MAX_SEQUENCE_LEN: usize = 32767;
 /// The used pwm clock frequency
 pub const PWM_CLK_HZ: u32 = 16_000_000;
 
-impl<'d, T: Instance> SequencePwm<'d, T> {
+impl<'d> SequencePwm<'d> {
     /// Create a new 1-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new_1ch(
-        pwm: impl Peripheral<P = T> + 'd,
-        ch0: impl Peripheral<P = impl GpioPin> + 'd,
-        config: Config,
-    ) -> Result<Self, Error> {
-        into_ref!(ch0);
-        Self::new_inner(pwm, Some(ch0.map_into()), None, None, None, config)
+    pub fn new_1ch<T: Instance>(pwm: Peri<'d, T>, ch0: Peri<'d, impl GpioPin>, config: Config) -> Result<Self, Error> {
+        Self::new_inner(pwm, Some(ch0.into()), None, None, None, config)
     }
 
     /// Create a new 2-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new_2ch(
-        pwm: impl Peripheral<P = T> + 'd,
-        ch0: impl Peripheral<P = impl GpioPin> + 'd,
-        ch1: impl Peripheral<P = impl GpioPin> + 'd,
+    pub fn new_2ch<T: Instance>(
+        pwm: Peri<'d, T>,
+        ch0: Peri<'d, impl GpioPin>,
+        ch1: Peri<'d, impl GpioPin>,
         config: Config,
     ) -> Result<Self, Error> {
-        into_ref!(ch0, ch1);
-        Self::new_inner(pwm, Some(ch0.map_into()), Some(ch1.map_into()), None, None, config)
+        Self::new_inner(pwm, Some(ch0.into()), Some(ch1.into()), None, None, config)
     }
 
     /// Create a new 3-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new_3ch(
-        pwm: impl Peripheral<P = T> + 'd,
-        ch0: impl Peripheral<P = impl GpioPin> + 'd,
-        ch1: impl Peripheral<P = impl GpioPin> + 'd,
-        ch2: impl Peripheral<P = impl GpioPin> + 'd,
+    pub fn new_3ch<T: Instance>(
+        pwm: Peri<'d, T>,
+        ch0: Peri<'d, impl GpioPin>,
+        ch1: Peri<'d, impl GpioPin>,
+        ch2: Peri<'d, impl GpioPin>,
         config: Config,
     ) -> Result<Self, Error> {
-        into_ref!(ch0, ch1, ch2);
-        Self::new_inner(
-            pwm,
-            Some(ch0.map_into()),
-            Some(ch1.map_into()),
-            Some(ch2.map_into()),
-            None,
-            config,
-        )
+        Self::new_inner(pwm, Some(ch0.into()), Some(ch1.into()), Some(ch2.into()), None, config)
     }
 
     /// Create a new 4-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new_4ch(
-        pwm: impl Peripheral<P = T> + 'd,
-        ch0: impl Peripheral<P = impl GpioPin> + 'd,
-        ch1: impl Peripheral<P = impl GpioPin> + 'd,
-        ch2: impl Peripheral<P = impl GpioPin> + 'd,
-        ch3: impl Peripheral<P = impl GpioPin> + 'd,
+    pub fn new_4ch<T: Instance>(
+        pwm: Peri<'d, T>,
+        ch0: Peri<'d, impl GpioPin>,
+        ch1: Peri<'d, impl GpioPin>,
+        ch2: Peri<'d, impl GpioPin>,
+        ch3: Peri<'d, impl GpioPin>,
         config: Config,
     ) -> Result<Self, Error> {
-        into_ref!(ch0, ch1, ch2, ch3);
         Self::new_inner(
             pwm,
-            Some(ch0.map_into()),
-            Some(ch1.map_into()),
-            Some(ch2.map_into()),
-            Some(ch3.map_into()),
+            Some(ch0.into()),
+            Some(ch1.into()),
+            Some(ch2.into()),
+            Some(ch3.into()),
             config,
         )
     }
 
-    fn new_inner(
-        _pwm: impl Peripheral<P = T> + 'd,
-        ch0: Option<PeripheralRef<'d, AnyPin>>,
-        ch1: Option<PeripheralRef<'d, AnyPin>>,
-        ch2: Option<PeripheralRef<'d, AnyPin>>,
-        ch3: Option<PeripheralRef<'d, AnyPin>>,
+    fn new_inner<T: Instance>(
+        _pwm: Peri<'d, T>,
+        ch0: Option<Peri<'d, AnyPin>>,
+        ch1: Option<Peri<'d, AnyPin>>,
+        ch2: Option<Peri<'d, AnyPin>>,
+        ch3: Option<Peri<'d, AnyPin>>,
         config: Config,
     ) -> Result<Self, Error> {
-        into_ref!(_pwm);
-
         let r = T::regs();
 
         if let Some(pin) = &ch0 {
             pin.set_low();
-            pin.conf()
-                .write(|w| w.dir().output().drive().variant(convert_drive(config.ch0_drive)));
+            pin.conf().write(|w| {
+                w.set_dir(gpiovals::Dir::OUTPUT);
+                w.set_input(gpiovals::Input::DISCONNECT);
+                convert_drive(w, config.ch0_drive);
+            });
         }
         if let Some(pin) = &ch1 {
             pin.set_low();
-            pin.conf()
-                .write(|w| w.dir().output().drive().variant(convert_drive(config.ch1_drive)));
+            pin.conf().write(|w| {
+                w.set_dir(gpiovals::Dir::OUTPUT);
+                w.set_input(gpiovals::Input::DISCONNECT);
+                convert_drive(w, config.ch1_drive);
+            });
         }
         if let Some(pin) = &ch2 {
             pin.set_low();
-            pin.conf()
-                .write(|w| w.dir().output().drive().variant(convert_drive(config.ch2_drive)));
+            pin.conf().write(|w| {
+                w.set_dir(gpiovals::Dir::OUTPUT);
+                w.set_input(gpiovals::Input::DISCONNECT);
+                convert_drive(w, config.ch2_drive);
+            });
         }
         if let Some(pin) = &ch3 {
             pin.set_low();
-            pin.conf()
-                .write(|w| w.dir().output().drive().variant(convert_drive(config.ch3_drive)));
+            pin.conf().write(|w| {
+                w.set_dir(gpiovals::Dir::OUTPUT);
+                w.set_input(gpiovals::Input::DISCONNECT);
+                convert_drive(w, config.ch3_drive);
+            });
         }
 
-        r.psel.out[0].write(|w| unsafe { w.bits(ch0.psel_bits()) });
-        r.psel.out[1].write(|w| unsafe { w.bits(ch1.psel_bits()) });
-        r.psel.out[2].write(|w| unsafe { w.bits(ch2.psel_bits()) });
-        r.psel.out[3].write(|w| unsafe { w.bits(ch3.psel_bits()) });
+        r.psel().out(0).write_value(ch0.psel_bits());
+        r.psel().out(1).write_value(ch1.psel_bits());
+        r.psel().out(2).write_value(ch2.psel_bits());
+        r.psel().out(3).write_value(ch3.psel_bits());
 
         // Disable all interrupts
-        r.intenclr.write(|w| unsafe { w.bits(0xFFFF_FFFF) });
-        r.shorts.reset();
-        r.events_stopped.reset();
-        r.events_loopsdone.reset();
-        r.events_seqend[0].reset();
-        r.events_seqend[1].reset();
-        r.events_pwmperiodend.reset();
-        r.events_seqstarted[0].reset();
-        r.events_seqstarted[1].reset();
+        r.intenclr().write(|w| w.0 = 0xFFFF_FFFF);
+        r.shorts().write(|_| ());
+        r.events_stopped().write_value(0);
+        r.events_loopsdone().write_value(0);
+        r.events_seqend(0).write_value(0);
+        r.events_seqend(1).write_value(0);
+        r.events_pwmperiodend().write_value(0);
+        r.events_seqstarted(0).write_value(0);
+        r.events_seqstarted(1).write_value(0);
 
-        r.decoder.write(|w| {
-            w.load().bits(config.sequence_load as u8);
-            w.mode().refresh_count()
+        r.decoder().write(|w| {
+            w.set_load(vals::Load::from_bits(config.sequence_load as u8));
+            w.set_mode(vals::Mode::REFRESH_COUNT);
         });
 
-        r.mode.write(|w| match config.counter_mode {
-            CounterMode::UpAndDown => w.updown().up_and_down(),
-            CounterMode::Up => w.updown().up(),
+        r.mode().write(|w| match config.counter_mode {
+            CounterMode::UpAndDown => w.set_updown(vals::Updown::UP_AND_DOWN),
+            CounterMode::Up => w.set_updown(vals::Updown::UP),
         });
-        r.prescaler.write(|w| w.prescaler().bits(config.prescaler as u8));
-        r.countertop.write(|w| unsafe { w.countertop().bits(config.max_duty) });
+        r.prescaler()
+            .write(|w| w.set_prescaler(vals::Prescaler::from_bits(config.prescaler as u8)));
+        r.countertop().write(|w| w.set_countertop(config.max_duty));
 
         Ok(Self {
-            _peri: _pwm,
+            r: T::regs(),
             ch0,
             ch1,
             ch2,
@@ -187,57 +185,43 @@ impl<'d, T: Instance> SequencePwm<'d, T> {
     /// Returns reference to `Stopped` event endpoint for PPI.
     #[inline(always)]
     pub fn event_stopped(&self) -> Event<'d> {
-        let r = T::regs();
-
-        Event::from_reg(&r.events_stopped)
+        Event::from_reg(self.r.events_stopped())
     }
 
     /// Returns reference to `LoopsDone` event endpoint for PPI.
     #[inline(always)]
     pub fn event_loops_done(&self) -> Event<'d> {
-        let r = T::regs();
-
-        Event::from_reg(&r.events_loopsdone)
+        Event::from_reg(self.r.events_loopsdone())
     }
 
     /// Returns reference to `PwmPeriodEnd` event endpoint for PPI.
     #[inline(always)]
     pub fn event_pwm_period_end(&self) -> Event<'d> {
-        let r = T::regs();
-
-        Event::from_reg(&r.events_pwmperiodend)
+        Event::from_reg(self.r.events_pwmperiodend())
     }
 
     /// Returns reference to `Seq0 End` event endpoint for PPI.
     #[inline(always)]
     pub fn event_seq_end(&self) -> Event<'d> {
-        let r = T::regs();
-
-        Event::from_reg(&r.events_seqend[0])
+        Event::from_reg(self.r.events_seqend(0))
     }
 
     /// Returns reference to `Seq1 End` event endpoint for PPI.
     #[inline(always)]
     pub fn event_seq1_end(&self) -> Event<'d> {
-        let r = T::regs();
-
-        Event::from_reg(&r.events_seqend[1])
+        Event::from_reg(self.r.events_seqend(1))
     }
 
     /// Returns reference to `Seq0 Started` event endpoint for PPI.
     #[inline(always)]
     pub fn event_seq0_started(&self) -> Event<'d> {
-        let r = T::regs();
-
-        Event::from_reg(&r.events_seqstarted[0])
+        Event::from_reg(self.r.events_seqstarted(0))
     }
 
     /// Returns reference to `Seq1 Started` event endpoint for PPI.
     #[inline(always)]
     pub fn event_seq1_started(&self) -> Event<'d> {
-        let r = T::regs();
-
-        Event::from_reg(&r.events_seqstarted[1])
+        Event::from_reg(self.r.events_seqstarted(1))
     }
 
     /// Returns reference to `Seq0 Start` task endpoint for PPI.
@@ -246,9 +230,7 @@ impl<'d, T: Instance> SequencePwm<'d, T> {
     /// Interacting with the sequence while it runs puts it in an unknown state
     #[inline(always)]
     pub unsafe fn task_start_seq0(&self) -> Task<'d> {
-        let r = T::regs();
-
-        Task::from_reg(&r.tasks_seqstart[0])
+        Task::from_reg(self.r.tasks_seqstart(0))
     }
 
     /// Returns reference to `Seq1 Started` task endpoint for PPI.
@@ -257,9 +239,7 @@ impl<'d, T: Instance> SequencePwm<'d, T> {
     /// Interacting with the sequence while it runs puts it in an unknown state
     #[inline(always)]
     pub unsafe fn task_start_seq1(&self) -> Task<'d> {
-        let r = T::regs();
-
-        Task::from_reg(&r.tasks_seqstart[1])
+        Task::from_reg(self.r.tasks_seqstart(1))
     }
 
     /// Returns reference to `NextStep` task endpoint for PPI.
@@ -268,9 +248,7 @@ impl<'d, T: Instance> SequencePwm<'d, T> {
     /// Interacting with the sequence while it runs puts it in an unknown state
     #[inline(always)]
     pub unsafe fn task_next_step(&self) -> Task<'d> {
-        let r = T::regs();
-
-        Task::from_reg(&r.tasks_nextstep)
+        Task::from_reg(self.r.tasks_nextstep())
     }
 
     /// Returns reference to `Stop` task endpoint for PPI.
@@ -279,36 +257,34 @@ impl<'d, T: Instance> SequencePwm<'d, T> {
     /// Interacting with the sequence while it runs puts it in an unknown state
     #[inline(always)]
     pub unsafe fn task_stop(&self) -> Task<'d> {
-        let r = T::regs();
-
-        Task::from_reg(&r.tasks_stop)
+        Task::from_reg(self.r.tasks_stop())
     }
 }
 
-impl<'a, T: Instance> Drop for SequencePwm<'a, T> {
+impl<'a> Drop for SequencePwm<'a> {
     fn drop(&mut self) {
-        let r = T::regs();
-
         if let Some(pin) = &self.ch0 {
             pin.set_low();
-            pin.conf().reset();
-            r.psel.out[0].reset();
+            pin.conf().write(|_| ());
+            self.r.psel().out(0).write_value(DISCONNECTED);
         }
         if let Some(pin) = &self.ch1 {
             pin.set_low();
-            pin.conf().reset();
-            r.psel.out[1].reset();
+            pin.conf().write(|_| ());
+            self.r.psel().out(1).write_value(DISCONNECTED);
         }
         if let Some(pin) = &self.ch2 {
             pin.set_low();
-            pin.conf().reset();
-            r.psel.out[2].reset();
+            pin.conf().write(|_| ());
+            self.r.psel().out(2).write_value(DISCONNECTED);
         }
         if let Some(pin) = &self.ch3 {
             pin.set_low();
-            pin.conf().reset();
-            r.psel.out[3].reset();
+            pin.conf().write(|_| ());
+            self.r.psel().out(3).write_value(DISCONNECTED);
         }
+
+        self.r.enable().write(|w| w.set_enable(false));
     }
 }
 
@@ -386,13 +362,13 @@ impl<'s> Sequence<'s> {
 /// A single sequence that can be started and stopped.
 /// Takes one sequence along with its configuration.
 #[non_exhaustive]
-pub struct SingleSequencer<'d, 's, T: Instance> {
-    sequencer: Sequencer<'d, 's, T>,
+pub struct SingleSequencer<'d, 's> {
+    sequencer: Sequencer<'d, 's>,
 }
 
-impl<'d, 's, T: Instance> SingleSequencer<'d, 's, T> {
+impl<'d, 's> SingleSequencer<'d, 's> {
     /// Create a new sequencer
-    pub fn new(pwm: &'s mut SequencePwm<'d, T>, words: &'s [u16], config: SequenceConfig) -> Self {
+    pub fn new(pwm: &'s mut SequencePwm<'d>, words: &'s [u16], config: SequenceConfig) -> Self {
         Self {
             sequencer: Sequencer::new(pwm, Sequence::new(words, config), None),
         }
@@ -425,16 +401,16 @@ impl<'d, 's, T: Instance> SingleSequencer<'d, 's, T> {
 /// In the case where no second sequence is provided then the first sequence
 /// is used.
 #[non_exhaustive]
-pub struct Sequencer<'d, 's, T: Instance> {
-    _pwm: &'s mut SequencePwm<'d, T>,
+pub struct Sequencer<'d, 's> {
+    _pwm: &'s mut SequencePwm<'d>,
     sequence0: Sequence<'s>,
     sequence1: Option<Sequence<'s>>,
 }
 
-impl<'d, 's, T: Instance> Sequencer<'d, 's, T> {
+impl<'d, 's> Sequencer<'d, 's> {
     /// Create a new double sequence. In the absence of sequence 1, sequence 0
     /// will be used twice in the one loop.
-    pub fn new(pwm: &'s mut SequencePwm<'d, T>, sequence0: Sequence<'s>, sequence1: Option<Sequence<'s>>) -> Self {
+    pub fn new(pwm: &'s mut SequencePwm<'d>, sequence0: Sequence<'s>, sequence1: Option<Sequence<'s>>) -> Self {
         Sequencer {
             _pwm: pwm,
             sequence0,
@@ -461,23 +437,19 @@ impl<'d, 's, T: Instance> Sequencer<'d, 's, T> {
 
         self.stop();
 
-        let r = T::regs();
+        let r = self._pwm.r;
 
-        r.seq0.refresh.write(|w| unsafe { w.bits(sequence0.config.refresh) });
-        r.seq0.enddelay.write(|w| unsafe { w.bits(sequence0.config.end_delay) });
-        r.seq0.ptr.write(|w| unsafe { w.bits(sequence0.words.as_ptr() as u32) });
-        r.seq0.cnt.write(|w| unsafe { w.bits(sequence0.words.len() as u32) });
+        r.seq(0).refresh().write(|w| w.0 = sequence0.config.refresh);
+        r.seq(0).enddelay().write(|w| w.0 = sequence0.config.end_delay);
+        r.seq(0).ptr().write_value(sequence0.words.as_ptr() as u32);
+        r.seq(0).cnt().write(|w| w.0 = sequence0.words.len() as u32);
 
-        r.seq1.refresh.write(|w| unsafe { w.bits(alt_sequence.config.refresh) });
-        r.seq1
-            .enddelay
-            .write(|w| unsafe { w.bits(alt_sequence.config.end_delay) });
-        r.seq1
-            .ptr
-            .write(|w| unsafe { w.bits(alt_sequence.words.as_ptr() as u32) });
-        r.seq1.cnt.write(|w| unsafe { w.bits(alt_sequence.words.len() as u32) });
+        r.seq(1).refresh().write(|w| w.0 = alt_sequence.config.refresh);
+        r.seq(1).enddelay().write(|w| w.0 = alt_sequence.config.end_delay);
+        r.seq(1).ptr().write_value(alt_sequence.words.as_ptr() as u32);
+        r.seq(1).cnt().write(|w| w.0 = alt_sequence.words.len() as u32);
 
-        r.enable.write(|w| w.enable().enabled());
+        r.enable().write(|w| w.set_enable(true));
 
         // defensive before seqstart
         compiler_fence(Ordering::SeqCst);
@@ -485,19 +457,17 @@ impl<'d, 's, T: Instance> Sequencer<'d, 's, T> {
         let seqstart_index = if start_seq == StartSequence::One { 1 } else { 0 };
 
         match times {
-            // just the one time, no loop count
             SequenceMode::Loop(n) => {
-                r.loop_.write(|w| unsafe { w.cnt().bits(n) });
+                r.loop_().write(|w| w.set_cnt(vals::LoopCnt::from_bits(n)));
             }
             // to play infinitely, repeat the sequence one time, then have loops done self trigger seq0 again
             SequenceMode::Infinite => {
-                r.loop_.write(|w| unsafe { w.cnt().bits(0x1) });
-                r.shorts.write(|w| w.loopsdone_seqstart0().enabled());
+                r.loop_().write(|w| w.set_cnt(vals::LoopCnt::from_bits(1)));
+                r.shorts().write(|w| w.set_loopsdone_seqstart0(true));
             }
         }
 
-        // tasks_seqstart() doesn't exist in all svds so write its bit instead
-        r.tasks_seqstart[seqstart_index].write(|w| unsafe { w.bits(0x01) });
+        r.tasks_seqstart(seqstart_index).write_value(1);
 
         Ok(())
     }
@@ -507,20 +477,18 @@ impl<'d, 's, T: Instance> Sequencer<'d, 's, T> {
     /// `start` so that they may be further mutated.
     #[inline(always)]
     pub fn stop(&self) {
-        let r = T::regs();
+        let r = self._pwm.r;
 
-        r.shorts.reset();
+        r.shorts().write(|_| ());
 
         compiler_fence(Ordering::SeqCst);
 
-        // tasks_stop() doesn't exist in all svds so write its bit instead
-        r.tasks_stop.write(|w| unsafe { w.bits(0x01) });
-
-        r.enable.write(|w| w.enable().disabled());
+        r.tasks_stop().write_value(1);
+        r.enable().write(|w| w.set_enable(false));
     }
 }
 
-impl<'d, 's, T: Instance> Drop for Sequencer<'d, 's, T> {
+impl<'d, 's> Drop for Sequencer<'d, 's> {
     fn drop(&mut self) {
         self.stop();
     }
@@ -599,105 +567,74 @@ pub enum CounterMode {
     UpAndDown,
 }
 
-impl<'d, T: Instance> SimplePwm<'d, T> {
+impl<'d> SimplePwm<'d> {
     /// Create a new 1-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new_1ch(pwm: impl Peripheral<P = T> + 'd, ch0: impl Peripheral<P = impl GpioPin> + 'd) -> Self {
-        unsafe {
-            into_ref!(ch0);
-            Self::new_inner(pwm, Some(ch0.map_into()), None, None, None)
-        }
+    pub fn new_1ch<T: Instance>(pwm: Peri<'d, T>, ch0: Peri<'d, impl GpioPin>) -> Self {
+        unsafe { Self::new_inner(pwm, Some(ch0.into()), None, None, None) }
     }
 
     /// Create a new 2-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new_2ch(
-        pwm: impl Peripheral<P = T> + 'd,
-        ch0: impl Peripheral<P = impl GpioPin> + 'd,
-        ch1: impl Peripheral<P = impl GpioPin> + 'd,
-    ) -> Self {
-        into_ref!(ch0, ch1);
-        Self::new_inner(pwm, Some(ch0.map_into()), Some(ch1.map_into()), None, None)
+    pub fn new_2ch<T: Instance>(pwm: Peri<'d, T>, ch0: Peri<'d, impl GpioPin>, ch1: Peri<'d, impl GpioPin>) -> Self {
+        Self::new_inner(pwm, Some(ch0.into()), Some(ch1.into()), None, None)
     }
 
     /// Create a new 3-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new_3ch(
-        pwm: impl Peripheral<P = T> + 'd,
-        ch0: impl Peripheral<P = impl GpioPin> + 'd,
-        ch1: impl Peripheral<P = impl GpioPin> + 'd,
-        ch2: impl Peripheral<P = impl GpioPin> + 'd,
+    pub fn new_3ch<T: Instance>(
+        pwm: Peri<'d, T>,
+        ch0: Peri<'d, impl GpioPin>,
+        ch1: Peri<'d, impl GpioPin>,
+        ch2: Peri<'d, impl GpioPin>,
     ) -> Self {
-        unsafe {
-            into_ref!(ch0, ch1, ch2);
-            Self::new_inner(
-                pwm,
-                Some(ch0.map_into()),
-                Some(ch1.map_into()),
-                Some(ch2.map_into()),
-                None,
-            )
-        }
+        unsafe { Self::new_inner(pwm, Some(ch0.into()), Some(ch1.into()), Some(ch2.into()), None) }
     }
 
     /// Create a new 4-channel PWM
     #[allow(unused_unsafe)]
-    pub fn new_4ch(
-        pwm: impl Peripheral<P = T> + 'd,
-        ch0: impl Peripheral<P = impl GpioPin> + 'd,
-        ch1: impl Peripheral<P = impl GpioPin> + 'd,
-        ch2: impl Peripheral<P = impl GpioPin> + 'd,
-        ch3: impl Peripheral<P = impl GpioPin> + 'd,
+    pub fn new_4ch<T: Instance>(
+        pwm: Peri<'d, T>,
+        ch0: Peri<'d, impl GpioPin>,
+        ch1: Peri<'d, impl GpioPin>,
+        ch2: Peri<'d, impl GpioPin>,
+        ch3: Peri<'d, impl GpioPin>,
     ) -> Self {
         unsafe {
-            into_ref!(ch0, ch1, ch2, ch3);
             Self::new_inner(
                 pwm,
-                Some(ch0.map_into()),
-                Some(ch1.map_into()),
-                Some(ch2.map_into()),
-                Some(ch3.map_into()),
+                Some(ch0.into()),
+                Some(ch1.into()),
+                Some(ch2.into()),
+                Some(ch3.into()),
             )
         }
     }
 
-    fn new_inner(
-        _pwm: impl Peripheral<P = T> + 'd,
-        ch0: Option<PeripheralRef<'d, AnyPin>>,
-        ch1: Option<PeripheralRef<'d, AnyPin>>,
-        ch2: Option<PeripheralRef<'d, AnyPin>>,
-        ch3: Option<PeripheralRef<'d, AnyPin>>,
+    fn new_inner<T: Instance>(
+        _pwm: Peri<'d, T>,
+        ch0: Option<Peri<'d, AnyPin>>,
+        ch1: Option<Peri<'d, AnyPin>>,
+        ch2: Option<Peri<'d, AnyPin>>,
+        ch3: Option<Peri<'d, AnyPin>>,
     ) -> Self {
-        into_ref!(_pwm);
-
         let r = T::regs();
 
-        if let Some(pin) = &ch0 {
-            pin.set_low();
-            pin.conf().write(|w| w.dir().output());
-        }
-        if let Some(pin) = &ch1 {
-            pin.set_low();
-            pin.conf().write(|w| w.dir().output());
-        }
-        if let Some(pin) = &ch2 {
-            pin.set_low();
-            pin.conf().write(|w| w.dir().output());
-        }
-        if let Some(pin) = &ch3 {
-            pin.set_low();
-            pin.conf().write(|w| w.dir().output());
-        }
+        for (i, ch) in [&ch0, &ch1, &ch2, &ch3].into_iter().enumerate() {
+            if let Some(pin) = ch {
+                pin.set_low();
 
-        // if NoPin provided writes disconnected (top bit 1) 0x80000000 else
-        // writes pin number ex 13 (0x0D) which is connected (top bit 0)
-        r.psel.out[0].write(|w| unsafe { w.bits(ch0.psel_bits()) });
-        r.psel.out[1].write(|w| unsafe { w.bits(ch1.psel_bits()) });
-        r.psel.out[2].write(|w| unsafe { w.bits(ch2.psel_bits()) });
-        r.psel.out[3].write(|w| unsafe { w.bits(ch3.psel_bits()) });
+                pin.conf().write(|w| {
+                    w.set_dir(gpiovals::Dir::OUTPUT);
+                    w.set_input(gpiovals::Input::DISCONNECT);
+                    w.set_drive(gpiovals::Drive::S0S1);
+                });
+            }
+            r.psel().out(i).write_value(ch.psel_bits());
+        }
 
         let pwm = Self {
-            _peri: _pwm,
+            r: T::regs(),
             ch0,
             ch1,
             ch2,
@@ -706,26 +643,25 @@ impl<'d, T: Instance> SimplePwm<'d, T> {
         };
 
         // Disable all interrupts
-        r.intenclr.write(|w| unsafe { w.bits(0xFFFF_FFFF) });
-        r.shorts.reset();
+        r.intenclr().write(|w| w.0 = 0xFFFF_FFFF);
+        r.shorts().write(|_| ());
 
         // Enable
-        r.enable.write(|w| w.enable().enabled());
+        r.enable().write(|w| w.set_enable(true));
 
-        r.seq0.ptr.write(|w| unsafe { w.bits((pwm.duty).as_ptr() as u32) });
+        r.seq(0).ptr().write_value((pwm.duty).as_ptr() as u32);
+        r.seq(0).cnt().write(|w| w.0 = 4);
+        r.seq(0).refresh().write(|w| w.0 = 0);
+        r.seq(0).enddelay().write(|w| w.0 = 0);
 
-        r.seq0.cnt.write(|w| unsafe { w.bits(4) });
-        r.seq0.refresh.write(|w| unsafe { w.bits(0) });
-        r.seq0.enddelay.write(|w| unsafe { w.bits(0) });
-
-        r.decoder.write(|w| {
-            w.load().individual();
-            w.mode().refresh_count()
+        r.decoder().write(|w| {
+            w.set_load(vals::Load::INDIVIDUAL);
+            w.set_mode(vals::Mode::REFRESH_COUNT);
         });
-        r.mode.write(|w| w.updown().up());
-        r.prescaler.write(|w| w.prescaler().div_16());
-        r.countertop.write(|w| unsafe { w.countertop().bits(1000) });
-        r.loop_.write(|w| w.cnt().disabled());
+        r.mode().write(|w| w.set_updown(vals::Updown::UP));
+        r.prescaler().write(|w| w.set_prescaler(vals::Prescaler::DIV_16));
+        r.countertop().write(|w| w.set_countertop(1000));
+        r.loop_().write(|w| w.set_cnt(vals::LoopCnt::DISABLED));
 
         pwm
     }
@@ -733,22 +669,19 @@ impl<'d, T: Instance> SimplePwm<'d, T> {
     /// Returns the enable state of the pwm counter
     #[inline(always)]
     pub fn is_enabled(&self) -> bool {
-        let r = T::regs();
-        r.enable.read().enable().bit_is_set()
+        self.r.enable().read().enable()
     }
 
     /// Enables the PWM generator.
     #[inline(always)]
     pub fn enable(&self) {
-        let r = T::regs();
-        r.enable.write(|w| w.enable().enabled());
+        self.r.enable().write(|w| w.set_enable(true));
     }
 
     /// Disables the PWM generator. Does NOT clear the last duty cycle from the pin.
     #[inline(always)]
     pub fn disable(&self) {
-        let r = T::regs();
-        r.enable.write(|w| w.enable().disabled());
+        self.r.enable().write(|w| w.set_enable(false));
     }
 
     /// Returns the current duty of the channel
@@ -758,38 +691,38 @@ impl<'d, T: Instance> SimplePwm<'d, T> {
 
     /// Sets duty cycle (15 bit) for a PWM channel.
     pub fn set_duty(&mut self, channel: usize, duty: u16) {
-        let r = T::regs();
-
         self.duty[channel] = duty & 0x7FFF;
 
         // reload ptr in case self was moved
-        r.seq0.ptr.write(|w| unsafe { w.bits((self.duty).as_ptr() as u32) });
+        self.r.seq(0).ptr().write_value((self.duty).as_ptr() as u32);
 
         // defensive before seqstart
         compiler_fence(Ordering::SeqCst);
 
-        r.events_seqend[0].reset();
+        self.r.events_seqend(0).write_value(0);
 
         // tasks_seqstart() doesn't exist in all svds so write its bit instead
-        r.tasks_seqstart[0].write(|w| unsafe { w.bits(1) });
+        self.r.tasks_seqstart(0).write_value(1);
 
         // defensive wait until waveform is loaded after seqstart so set_duty
         // can't be called again while dma is still reading
         if self.is_enabled() {
-            while r.events_seqend[0].read().bits() == 0 {}
+            while self.r.events_seqend(0).read() == 0 {}
         }
     }
 
     /// Sets the PWM clock prescaler.
     #[inline(always)]
     pub fn set_prescaler(&self, div: Prescaler) {
-        T::regs().prescaler.write(|w| w.prescaler().bits(div as u8));
+        self.r
+            .prescaler()
+            .write(|w| w.set_prescaler(vals::Prescaler::from_bits(div as u8)));
     }
 
     /// Gets the PWM clock prescaler.
     #[inline(always)]
     pub fn prescaler(&self) -> Prescaler {
-        match T::regs().prescaler.read().prescaler().bits() {
+        match self.r.prescaler().read().prescaler().to_bits() {
             0 => Prescaler::Div1,
             1 => Prescaler::Div2,
             2 => Prescaler::Div4,
@@ -805,15 +738,13 @@ impl<'d, T: Instance> SimplePwm<'d, T> {
     /// Sets the maximum duty cycle value.
     #[inline(always)]
     pub fn set_max_duty(&self, duty: u16) {
-        T::regs()
-            .countertop
-            .write(|w| unsafe { w.countertop().bits(duty.min(32767u16)) });
+        self.r.countertop().write(|w| w.set_countertop(duty.min(32767u16)));
     }
 
     /// Returns the maximum duty cycle value.
     #[inline(always)]
     pub fn max_duty(&self) -> u16 {
-        T::regs().countertop.read().countertop().bits()
+        self.r.countertop().read().countertop()
     }
 
     /// Sets the PWM output frequency.
@@ -836,7 +767,7 @@ impl<'d, T: Instance> SimplePwm<'d, T> {
     #[inline(always)]
     pub fn set_ch0_drive(&self, drive: OutputDrive) {
         if let Some(pin) = &self.ch0 {
-            pin.conf().modify(|_, w| w.drive().variant(convert_drive(drive)));
+            pin.conf().modify(|w| convert_drive(w, drive));
         }
     }
 
@@ -844,7 +775,7 @@ impl<'d, T: Instance> SimplePwm<'d, T> {
     #[inline(always)]
     pub fn set_ch1_drive(&self, drive: OutputDrive) {
         if let Some(pin) = &self.ch1 {
-            pin.conf().modify(|_, w| w.drive().variant(convert_drive(drive)));
+            pin.conf().modify(|w| convert_drive(w, drive));
         }
     }
 
@@ -852,7 +783,7 @@ impl<'d, T: Instance> SimplePwm<'d, T> {
     #[inline(always)]
     pub fn set_ch2_drive(&self, drive: OutputDrive) {
         if let Some(pin) = &self.ch2 {
-            pin.conf().modify(|_, w| w.drive().variant(convert_drive(drive)));
+            pin.conf().modify(|w| convert_drive(w, drive));
         }
     }
 
@@ -860,47 +791,47 @@ impl<'d, T: Instance> SimplePwm<'d, T> {
     #[inline(always)]
     pub fn set_ch3_drive(&self, drive: OutputDrive) {
         if let Some(pin) = &self.ch3 {
-            pin.conf().modify(|_, w| w.drive().variant(convert_drive(drive)));
+            pin.conf().modify(|w| convert_drive(w, drive));
         }
     }
 }
 
-impl<'a, T: Instance> Drop for SimplePwm<'a, T> {
+impl<'a> Drop for SimplePwm<'a> {
     fn drop(&mut self) {
-        let r = T::regs();
+        let r = &self.r;
 
         self.disable();
 
         if let Some(pin) = &self.ch0 {
             pin.set_low();
-            pin.conf().reset();
-            r.psel.out[0].reset();
+            pin.conf().write(|_| ());
+            r.psel().out(0).write_value(DISCONNECTED);
         }
         if let Some(pin) = &self.ch1 {
             pin.set_low();
-            pin.conf().reset();
-            r.psel.out[1].reset();
+            pin.conf().write(|_| ());
+            r.psel().out(1).write_value(DISCONNECTED);
         }
         if let Some(pin) = &self.ch2 {
             pin.set_low();
-            pin.conf().reset();
-            r.psel.out[2].reset();
+            pin.conf().write(|_| ());
+            r.psel().out(2).write_value(DISCONNECTED);
         }
         if let Some(pin) = &self.ch3 {
             pin.set_low();
-            pin.conf().reset();
-            r.psel.out[3].reset();
+            pin.conf().write(|_| ());
+            r.psel().out(3).write_value(DISCONNECTED);
         }
     }
 }
 
 pub(crate) trait SealedInstance {
-    fn regs() -> &'static pac::pwm0::RegisterBlock;
+    fn regs() -> pac::pwm::Pwm;
 }
 
 /// PWM peripheral instance.
 #[allow(private_bounds)]
-pub trait Instance: Peripheral<P = Self> + SealedInstance + 'static {
+pub trait Instance: SealedInstance + PeripheralType + 'static {
     /// Interrupt for this peripheral.
     type Interrupt: interrupt::typelevel::Interrupt;
 }
@@ -908,8 +839,8 @@ pub trait Instance: Peripheral<P = Self> + SealedInstance + 'static {
 macro_rules! impl_pwm {
     ($type:ident, $pac_type:ident, $irq:ident) => {
         impl crate::pwm::SealedInstance for peripherals::$type {
-            fn regs() -> &'static pac::pwm0::RegisterBlock {
-                unsafe { &*pac::$pac_type::ptr() }
+            fn regs() -> pac::pwm::Pwm {
+                pac::$pac_type
             }
         }
         impl crate::pwm::Instance for peripherals::$type {
