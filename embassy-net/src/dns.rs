@@ -62,7 +62,7 @@ impl<'a> DnsSocket<'a> {
         name: &str,
         qtype: DnsQueryType,
     ) -> Result<Vec<IpAddress, { smoltcp::config::DNS_MAX_RESULT_COUNT }>, Error> {
-        self.stack.dns_query(name, qtype).await
+        self.stack.dns_query(name, qtype).await.map_err(Into::into)
     }
 }
 

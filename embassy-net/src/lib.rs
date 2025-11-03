@@ -536,7 +536,7 @@ impl<'d> Stack<'d> {
         &self,
         name: &str,
         qtype: dns::DnsQueryType,
-    ) -> Result<Vec<IpAddress, { smoltcp::config::DNS_MAX_RESULT_COUNT }>, dns::Error> {
+    ) -> Result<Vec<IpAddress, { smoltcp::config::DNS_MAX_RESULT_COUNT }>, dns::GetQueryResultError> {
         // For A and AAAA queries we try detect whether `name` is just an IP address
         match qtype {
             #[cfg(feature = "proto-ipv4")]
@@ -570,7 +570,8 @@ impl<'d> Stack<'d> {
                 }
             })
         })
-        .await?;
+        .await
+        .map_err(|_| dns::GetQueryResultError::Failed)?;
 
         #[must_use = "to delay the drop handler invocation to the end of the scope"]
         struct OnDrop<F: FnOnce()> {
@@ -725,7 +726,7 @@ impl Inner {
     }
 
     fn apply_static_config(&mut self) {
-        let mut addrs = Vec::new();
+        let mut addrs: Vec<IpCidr, { smoltcp::config::IFACE_MAX_ADDR_COUNT }> = Vec::new();
         #[cfg(feature = "dns")]
         let mut dns_servers: Vec<_, 6> = Vec::new();
         #[cfg(feature = "proto-ipv4")]
