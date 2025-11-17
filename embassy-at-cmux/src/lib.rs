@@ -53,7 +53,9 @@ impl Lines {
         // if let Some((mask, val)) = self.hangup_mask.get() {
         if !self.rx.get().0.dv() {
             if !self.hangup.get() {
-                warn!("HANGUP detected!");
+                let (control, brk) = self.rx.get();
+                warn!("HANGUP detected! Control: rtc={} rtr={} ic={} dv={}, mask={:?}",
+                    control.rtc(), control.rtr(), control.ic(), control.dv(), self.hangup_mask.get());
                 // self.hangup_waker.wake();
             }
             // self.hangup.set(true);
@@ -195,8 +197,10 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
 
         let mut last_received = Instant::now();
         let mut ping_number = 1u8;
+        let mut loop_count = 0u32;
 
         loop {
+            loop_count += 1;
             let mut futs: Vec<_, N> = Vec::new();
             for c in &mut self.tx {
                 let res = futs.push(c.fill_buf());
@@ -204,6 +208,9 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
             }
 
             let ping_fut = Timer::at(last_received + Duration::from_secs(5 * ping_number as u64));
+
+            let select_start = Instant::now();
+            debug!("CMUX Runner: waiting in select3 (iteration {})", loop_count);
 
             match select3(
                 select_slice(pin!(&mut futs)),
@@ -213,6 +220,8 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
             .await
             {
                 Either3::First((buf, i)) => {
+                    let select_elapsed = Instant::now() - select_start;
+                    debug!("CMUX Runner: TX data ready for channel {}, {} bytes available (waited {}ms)", i + 1, buf.len(), select_elapsed.as_millis());
                     // let (control, _) = self.lines[i].tx.get();
                     // if control.fc() {
                     //     warn!("Channel {} TX flow controlled!", i + 1);
@@ -234,9 +243,15 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                         information: Information::Data(&buf[..len]),
                     };
 
+                    debug!("CMUX Runner: writing {} bytes frame for channel {} to UART", len, i + 1);
+                    let start = Instant::now();
                     if let Err(e) = frame.write(&mut port_w).await {
                         error!("Failed to write data frame for channel {}: {:?}", i + 1, e);
                         return Err(e);
+                    }
+                    let elapsed = Instant::now() - start;
+                    if elapsed.as_millis() > 100 {
+                        warn!("CMUX Runner: UART frame write blocked for {}ms, {} bytes on channel {}", elapsed.as_millis(), len, i + 1);
                     }
 
                     drop(futs);
@@ -245,10 +260,13 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                 }
 
                 Either3::Second(Err(e)) => {
-                    error!("Got error while searching for RX header: {:?}", e);
+                    let select_elapsed = Instant::now() - select_start;
+                    error!("CMUX Runner: RX error after {}ms: {:?}", select_elapsed.as_millis(), e);
                     continue;
                 }
                 Either3::Second(Ok(mut header)) => {
+                    let select_elapsed = Instant::now() - select_start;
+                    debug!("CMUX Runner: RX frame received (waited {}ms), type={:?}", select_elapsed.as_millis(), header.frame_type);
                     trace!("{:?}", header);
 
                     last_received = Instant::now();
@@ -278,12 +296,27 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                                         let lines = &self.lines[msc.dlci as usize - 1];
                                         let new_control = msc.control.with_ea(false);
                                         let new_brk = msc.brk.map(|b| b.with_ea(false));
-                                        debug!(
-                                            "channel {:?} lines rx: {:?} -> {:?}",
+                                        info!(
+                                            "Modem Status for channel {}: rtc={} rtr={} ic={} dv={} (old: {:?} -> new: {:?})",
                                             msc.dlci,
+                                            new_control.rtc(),
+                                            new_control.rtr(),
+                                            new_control.ic(),
+                                            new_control.dv(),
                                             lines.rx.get(),
                                             (new_control, new_brk)
                                         );
+
+                                        // Check if flow control changed
+                                        let old_fc = lines.rx.get().0.fc();
+                                        let new_fc = new_control.fc();
+                                        if old_fc != new_fc {
+                                            if new_fc {
+                                                warn!("⚠️ Channel {} flow control ENABLED (modem telling us to STOP sending)", msc.dlci);
+                                            } else {
+                                                info!("✓ Channel {} flow control DISABLED (modem ready to receive)", msc.dlci);
+                                            }
+                                        }
 
                                         // Modem is telling us something about
                                         // channel `msc.dlci`.
@@ -449,8 +482,13 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                         return Err(e);
                     }
                 }
-                Either3::Third(_) if ping_number >= MAX_PINGS => {}
+                Either3::Third(_) if ping_number >= MAX_PINGS => {
+                    let select_elapsed = Instant::now() - select_start;
+                    warn!("CMUX Runner: Ping timeout reached max pings after {}ms", select_elapsed.as_millis());
+                }
                 Either3::Third(_) => {
+                    let select_elapsed = Instant::now() - select_start;
+                    debug!("CMUX Runner: Ping timeout after {}ms, ping_number={}", select_elapsed.as_millis(), ping_number);
                     // Nothing has been received for a while -> test the modem
                     debug!("Sending PING to the modem.");
                     // frame::Uih {
@@ -624,7 +662,22 @@ impl<'a, const BUF: usize> BufRead for Channel<'a, BUF> {
 
 impl<'a, const BUF: usize> Write for Channel<'a, BUF> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        check_hangup(self.tx.write(buf), self.lines).await
+        let start = Instant::now();
+        let result = check_hangup(self.tx.write(buf), self.lines).await;
+        let elapsed = Instant::now() - start;
+
+        match &result {
+            Ok(n) => {
+                if elapsed.as_millis() > 50 {
+                    warn!("CMUX TX: write blocked for {}ms, wrote {} bytes", elapsed.as_millis(), n);
+                }
+            }
+            Err(e) => {
+                error!("CMUX TX: write failed after {}ms: {:?}", elapsed.as_millis(), e);
+            }
+        }
+
+        result
     }
 }
 
@@ -654,7 +707,22 @@ impl<'a, const BUF: usize> ErrorType for ChannelTx<'a, BUF> {
 
 impl<'a, const BUF: usize> Write for ChannelTx<'a, BUF> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        check_hangup(self.tx.write(buf), self.lines).await
+        let start = Instant::now();
+        let result = check_hangup(self.tx.write(buf), self.lines).await;
+        let elapsed = Instant::now() - start;
+
+        match &result {
+            Ok(n) => {
+                if elapsed.as_millis() > 50 {
+                    warn!("CMUX ChannelTx: write blocked for {}ms, wrote {} bytes", elapsed.as_millis(), n);
+                }
+            }
+            Err(e) => {
+                error!("CMUX ChannelTx: write failed after {}ms: {:?}", elapsed.as_millis(), e);
+            }
+        }
+
+        result
     }
 }
 

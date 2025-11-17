@@ -11,6 +11,7 @@ use core::mem::MaybeUninit;
 use embassy_futures::select::{select, Either};
 use embassy_net_driver_channel as ch;
 use embassy_net_driver_channel::driver::LinkState;
+use embassy_time::Instant;
 use embedded_io_async::{BufRead, Write};
 use ppproto::pppos::{BufferFullError, PPPoS, PPPoSAction};
 pub use ppproto::{Config, Ipv4Status};
@@ -72,12 +73,16 @@ impl<'d> Runner<'d> {
         config: ppproto::Config<'_>,
         mut on_ipv4_up: impl FnMut(Ipv4Status),
     ) -> Result<Infallible, RunError<RW::Error>> {
+        info!("PPP runner starting, initiating connection...");
         let mut ppp = PPPoS::new(config);
         ppp.open().unwrap();
 
         let (state_chan, mut rx_chan, mut tx_chan) = self.ch.borrow_split();
         state_chan.set_link_state(LinkState::Down);
-        let _ondrop = OnDrop::new(|| state_chan.set_link_state(LinkState::Down));
+        let _ondrop = OnDrop::new(|| {
+            warn!("PPP runner dropped, setting link state to Down");
+            state_chan.set_link_state(LinkState::Down);
+        });
 
         let mut rx_buf = [0; 2048];
         let mut tx_buf = [0; 2048];
@@ -91,9 +96,15 @@ impl<'d> Runner<'d> {
                 let rx_data = match needs_poll {
                     true => &[][..],
                     false => match rw.fill_buf().await {
-                        Ok(rx_data) if rx_data.len() == 0 => return Err(RunError::Eof),
+                        Ok(rx_data) if rx_data.len() == 0 => {
+                            error!("PPP read EOF from serial port");
+                            return Err(RunError::Eof);
+                        }
                         Ok(rx_data) => rx_data,
-                        Err(e) => return Err(RunError::Read(e)),
+                        Err(e) => {
+                            error!("PPP read error from serial port");
+                            return Err(RunError::Read(e));
+                        }
                     },
                 };
                 Ok((buf, rx_data))
@@ -114,22 +125,37 @@ impl<'d> Runner<'d> {
                             buf[..pkt.len()].copy_from_slice(pkt);
                             rx_chan.rx_done(pkt.len());
                         }
-                        PPPoSAction::Transmit(n) => rw.write_all(&tx_buf[..n]).await.map_err(RunError::Write)?,
+                        PPPoSAction::Transmit(n) => {
+                            debug!("PPP TX: attempting to write {} bytes to serial", n);
+                            let start = Instant::now();
+                            rw.write_all(&tx_buf[..n]).await.map_err(RunError::Write)?;
+                            let elapsed = Instant::now() - start;
+                            if elapsed.as_millis() > 100 {
+                                warn!("PPP TX: write_all took {}ms for {} bytes (slow!)", elapsed.as_millis(), n);
+                            } else {
+                                debug!("PPP TX: wrote {} bytes in {}ms", n, elapsed.as_millis());
+                            }
+                        }
                     }
 
                     let status = ppp.status();
                     match status.phase {
                         ppproto::Phase::Dead => {
+                            debug!("PPP phase Dead, terminating connection");
                             return Err(RunError::Terminated);
                         }
                         ppproto::Phase::Open => {
                             if !was_up {
+                                info!("PPP connection UP, phase: {:?}, ipv4: {:?}", status.phase, status.ipv4);
                                 on_ipv4_up(status.ipv4.unwrap());
                             }
                             was_up = true;
                             state_chan.set_link_state(LinkState::Up);
                         }
                         _ => {
+                            if was_up {
+                                warn!("PPP connection DOWN, phase: {:?} (was up before)", status.phase);
+                            }
                             was_up = false;
                             state_chan.set_link_state(LinkState::Down);
                         }
@@ -137,7 +163,20 @@ impl<'d> Runner<'d> {
                 }
                 Either::Second(pkt) => {
                     match ppp.send(pkt, &mut tx_buf) {
-                        Ok(n) => rw.write_all(&tx_buf[..n]).await.map_err(RunError::Write)?,
+                        Ok(n) => {
+                            debug!("PPP TX: attempting to write {} bytes network packet to serial", n);
+                            let start = Instant::now();
+                            rw.write_all(&tx_buf[..n]).await.map_err(|e| {
+                                error!("PPP TX write_all failed, {} bytes lost", n);
+                                RunError::Write(e)
+                            })?;
+                            let elapsed = Instant::now() - start;
+                            if elapsed.as_millis() > 100 {
+                                warn!("PPP TX: network packet write_all took {}ms for {} bytes (slow!)", elapsed.as_millis(), n);
+                            } else {
+                                debug!("PPP TX: wrote {} bytes network packet in {}ms", n, elapsed.as_millis());
+                            }
+                        }
                         Err(BufferFullError) => unreachable!(),
                     }
                     tx_chan.tx_done();

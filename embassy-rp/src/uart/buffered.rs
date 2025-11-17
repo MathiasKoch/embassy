@@ -376,6 +376,10 @@ impl BufferedUartTx {
         state: &'static State,
         buf: &'d [u8],
     ) -> impl Future<Output = Result<usize, Error>> + 'd {
+        use embassy_time::Instant;
+        let start = Instant::now();
+        let mut warned = false;
+
         poll_fn(move |cx| {
             if buf.is_empty() {
                 return Poll::Ready(Ok(0));
@@ -388,8 +392,20 @@ impl BufferedUartTx {
                 n
             });
             if n == 0 {
+                let elapsed = Instant::now() - start;
+                if !warned && elapsed.as_millis() > 100 {
+                    let buf_len = unsafe { state.tx_buf.len() };
+                    warn!("UART TX: software buffer full for {}ms! buf_len={}, wanted to write {} bytes",
+                        elapsed.as_millis(), buf_len, buf.len());
+                    warned = true;
+                }
                 state.tx_waker.register(cx.waker());
                 return Poll::Pending;
+            }
+
+            let elapsed = Instant::now() - start;
+            if elapsed.as_millis() > 10 {
+                debug!("UART TX: wrote {} bytes to software buffer after {}ms wait", n, elapsed.as_millis());
             }
 
             // The TX interrupt only triggers when the there was data in the
