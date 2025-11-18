@@ -503,11 +503,12 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
         }
 
         for id in (0..N).rev() {
-            let channel_id = id + 1;
-            debug!("Closing down the logical channel {}.", channel_id);
-            if self.lines[channel_id].opened.get() {
-                if let Err(e) = (frame::Disc { id: channel_id as u8 }).write(&mut port_w).await {
-                    error!("Failed to send DISC for channel {}: {:?}", channel_id, e);
+            let dlci = id + 1;
+            let line = &self.lines[id];
+            debug!("Closing down the logical channel {}.", dlci);
+            if line.opened.get() {
+                if let Err(e) = (frame::Disc { id: dlci as u8 }).write(&mut port_w).await {
+                    error!("Failed to send DISC for channel {}: {:?}", dlci, e);
                     return Err(e);
                 }
             }

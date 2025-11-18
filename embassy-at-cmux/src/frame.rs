@@ -684,7 +684,7 @@ impl<'a, R: embedded_io_async::BufRead> RxHeader<'a, R> {
         while !data.is_empty() {
             let buf = r.fill_buf().await.map_err(|e| Error::Read(e.kind()))?;
             if buf.is_empty() {
-                panic!("EOF");
+                return Err(Error::Read(embedded_io_async::ErrorKind::BrokenPipe));
             }
             let n = buf.len().min(data.len());
             data[..n].copy_from_slice(&buf[..n]);
@@ -730,7 +730,7 @@ impl<'a, R: embedded_io_async::BufRead> RxHeader<'a, R> {
             };
             if buf.is_empty() {
                 error!("RxHeader copy: EOF with {} bytes remaining", remaining);
-                panic!("EOF");
+                return Err(Error::Read(embedded_io_async::ErrorKind::BrokenPipe));
             }
             let n = buf.len().min(self.len);
 
@@ -748,6 +748,9 @@ impl<'a, R: embedded_io_async::BufRead> RxHeader<'a, R> {
                     return Err(err);
                 }
             };
+            if self.frame_type == FrameType::Ui {
+                self.fcs.update(&buf[..n]);
+            }
             self.reader.consume(n);
             self.len -= n;
         }
@@ -771,7 +774,7 @@ impl<'a, R: embedded_io_async::BufRead> RxHeader<'a, R> {
             // Discard any information here
             let buf = self.reader.fill_buf().await.map_err(|e| Error::Read(e.kind()))?;
             if buf.is_empty() {
-                panic!("EOF");
+                return Err(Error::Read(embedded_io_async::ErrorKind::BrokenPipe));
             }
             let n = buf.len().min(self.len);
             warn!("Discarding {} bytes of data in {:?}", n, self.frame_type);
@@ -1071,5 +1074,67 @@ mod tests {
         );
         assert_eq!(&buf[4..4 + data.len()], data);
         assert_eq!(&buf[4 + data.len()..4 + data.len() + 2], &[0x5D, 0xF9][..]);
+    }
+
+    fn build_ui_frame(id: u8, data: &[u8]) -> heapless::Vec<u8, 128> {
+        let mut frame = heapless::Vec::<u8, 128>::new();
+        frame.push(FLAG).unwrap();
+
+        let addr = id << 2 | EA | CR::Command as u8;
+        let ctrl = FrameType::Ui as u8 | PF::Final as u8;
+        let len = (data.len() as u8) << 1 | EA;
+
+        frame.extend_from_slice(&[addr, ctrl, len]).unwrap();
+        frame.extend_from_slice(data).unwrap();
+
+        let mut fcs_byte = None;
+        for candidate in 0u16..=255 {
+            let mut digest = FCS.digest();
+            digest.update(&[addr, ctrl, len]);
+            digest.update(data);
+            digest.update(&[candidate as u8]);
+            if digest.finalize() == GOOD_FCS {
+                fcs_byte = Some(candidate as u8);
+                break;
+            }
+        }
+
+        frame.push(fcs_byte.expect("valid CRC byte")).unwrap();
+        frame.push(FLAG).unwrap();
+        frame
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn ui_frame_copy_updates_crc() {
+        let data = b"Hello UI";
+        let frame = build_ui_frame(2, data);
+
+        let mut reader = &frame[..];
+        let mut header = RxHeader::read(&mut reader).await.unwrap();
+        assert_eq!(header.frame_type, FrameType::Ui);
+
+        let mut channel_buf = [0u8; 16];
+        let mut channel_writer = &mut channel_buf[..];
+        header.copy(&mut channel_writer).await.unwrap();
+        header.finalize().await.unwrap();
+    }
+
+    #[cfg(test)]
+    #[tokio::test]
+    async fn finalize_reports_unexpected_eof() {
+        let data = b"Bye";
+        let frame = build_ui_frame(1, data);
+
+        let mut reader = &frame[..frame.len() - 1];
+        let mut header = RxHeader::read(&mut reader).await.unwrap();
+        let mut channel_buf = [0u8; 8];
+        let mut channel_writer = &mut channel_buf[..];
+        header.copy(&mut channel_writer).await.unwrap();
+
+        match header.finalize().await {
+            Err(Error::Read(embedded_io_async::ErrorKind::BrokenPipe)) => {}
+            other => panic!("expected UnexpectedEof, got {:?}", other),
+        }
     }
 }
