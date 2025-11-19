@@ -126,14 +126,11 @@ impl<'d> Runner<'d> {
                             rx_chan.rx_done(pkt.len());
                         }
                         PPPoSAction::Transmit(n) => {
-                            debug!("PPP TX: attempting to write {} bytes to serial", n);
                             let start = Instant::now();
                             rw.write_all(&tx_buf[..n]).await.map_err(RunError::Write)?;
                             let elapsed = Instant::now() - start;
                             if elapsed.as_millis() > 100 {
                                 warn!("PPP TX: write_all took {}ms for {} bytes (slow!)", elapsed.as_millis(), n);
-                            } else {
-                                debug!("PPP TX: wrote {} bytes in {}ms", n, elapsed.as_millis());
                             }
                         }
                     }
@@ -164,7 +161,6 @@ impl<'d> Runner<'d> {
                 Either::Second(pkt) => {
                     match ppp.send(pkt, &mut tx_buf) {
                         Ok(n) => {
-                            debug!("PPP TX: attempting to write {} bytes network packet to serial", n);
                             let start = Instant::now();
                             rw.write_all(&tx_buf[..n]).await.map_err(|e| {
                                 error!("PPP TX write_all failed, {} bytes lost", n);
@@ -173,8 +169,6 @@ impl<'d> Runner<'d> {
                             let elapsed = Instant::now() - start;
                             if elapsed.as_millis() > 100 {
                                 warn!("PPP TX: network packet write_all took {}ms for {} bytes (slow!)", elapsed.as_millis(), n);
-                            } else {
-                                debug!("PPP TX: wrote {} bytes network packet in {}ms", n, elapsed.as_millis());
                             }
                         }
                         Err(BufferFullError) => unreachable!(),

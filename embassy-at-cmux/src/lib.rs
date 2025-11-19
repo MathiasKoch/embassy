@@ -195,33 +195,27 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
             }
         }
 
-        let mut last_received = Instant::now();
-        let mut ping_number = 1u8;
-        let mut loop_count = 0u32;
+        // let mut last_received = Instant::now();
+        // let mut ping_number = 1u8;
+        // let mut loop_count = 0u32;
 
         loop {
-            loop_count += 1;
+            // loop_count += 1;
             let mut futs: Vec<_, N> = Vec::new();
             for c in &mut self.tx {
                 let res = futs.push(c.fill_buf());
                 assert!(res.is_ok());
             }
 
-            let ping_fut = Timer::at(last_received + Duration::from_secs(5 * ping_number as u64));
+            // let ping_fut = Timer::at(last_received + Duration::from_secs(5 * ping_number as u64));
 
-            let select_start = Instant::now();
-            debug!("CMUX Runner: waiting in select3 (iteration {})", loop_count);
-
-            match select3(
+            match select(
                 select_slice(pin!(&mut futs)),
                 frame::RxHeader::read(&mut port_r),
-                ping_fut,
             )
             .await
             {
-                Either3::First((buf, i)) => {
-                    let select_elapsed = Instant::now() - select_start;
-                    debug!("CMUX Runner: TX data ready for channel {}, {} bytes available (waited {}ms)", i + 1, buf.len(), select_elapsed.as_millis());
+                Either::First((buf, i)) => {
                     // let (control, _) = self.lines[i].tx.get();
                     // if control.fc() {
                     //     warn!("Channel {} TX flow controlled!", i + 1);
@@ -243,33 +237,24 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                         information: Information::Data(&buf[..len]),
                     };
 
-                    debug!("CMUX Runner: writing {} bytes frame for channel {} to UART", len, i + 1);
-                    let start = Instant::now();
                     if let Err(e) = frame.write(&mut port_w).await {
                         error!("Failed to write data frame for channel {}: {:?}", i + 1, e);
                         return Err(e);
                     }
-                    let elapsed = Instant::now() - start;
-                    if elapsed.as_millis() > 100 {
-                        warn!("CMUX Runner: UART frame write blocked for {}ms, {} bytes on channel {}", elapsed.as_millis(), len, i + 1);
-                    }
+                    
 
                     drop(futs);
 
                     self.tx[i].consume(len);
                 }
 
-                Either3::Second(Err(e)) => {
-                    let select_elapsed = Instant::now() - select_start;
-                    error!("CMUX Runner: RX error after {}ms: {:?}", select_elapsed.as_millis(), e);
+                Either::Second(Err(e)) => {
+                    error!("CMUX Runner: RX error");
                     continue;
                 }
-                Either3::Second(Ok(mut header)) => {
-                    let select_elapsed = Instant::now() - select_start;
-                    debug!("CMUX Runner: RX frame received (waited {}ms), type={:?}", select_elapsed.as_millis(), header.frame_type);
+                Either::Second(Ok(mut header)) => {
                     trace!("{:?}", header);
 
-                    last_received = Instant::now();
 
                     match header.frame_type {
                         FrameType::Ui | FrameType::Uih if header.is_control() => {
@@ -481,23 +466,6 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                         error!("Failed to finalize header: {:?}", e);
                         return Err(e);
                     }
-                }
-                Either3::Third(_) if ping_number >= MAX_PINGS => {
-                    let select_elapsed = Instant::now() - select_start;
-                    warn!("CMUX Runner: Ping timeout reached max pings after {}ms", select_elapsed.as_millis());
-                }
-                Either3::Third(_) => {
-                    let select_elapsed = Instant::now() - select_start;
-                    debug!("CMUX Runner: Ping timeout after {}ms, ping_number={}", select_elapsed.as_millis(), ping_number);
-                    // Nothing has been received for a while -> test the modem
-                    debug!("Sending PING to the modem.");
-                    // frame::Uih {
-                    //     id: 0,
-                    //     information: Information::Data(b"\x23\x09PING"),
-                    // }
-                    // .write(&mut port_w)
-                    // .await?;
-                    ping_number += 1;
                 }
             }
         }
