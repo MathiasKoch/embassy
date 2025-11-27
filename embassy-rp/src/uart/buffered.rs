@@ -395,8 +395,10 @@ impl BufferedUartTx {
                 let elapsed = Instant::now() - start;
                 if !warned && elapsed.as_millis() > 100 {
                     let buf_len = unsafe { state.tx_buf.len() };
-                    warn!("UART TX: software buffer full for {}ms! buf_len={}, wanted to write {} bytes",
-                        elapsed.as_millis(), buf_len, buf.len());
+                    let cts_state = info.regs.uartfr().read().cts();
+                    warn!("UART TX: software buffer full for {}ms! buf_len={}, wanted to write {} bytes, CTS={} ({})",
+                        elapsed.as_millis(), buf_len, buf.len(), cts_state,
+                        if cts_state { "modem ready" } else { "MODEM BLOCKING" });
                     warned = true;
                 }
                 state.tx_waker.register(cx.waker());

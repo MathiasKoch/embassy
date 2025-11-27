@@ -632,44 +632,99 @@ impl<'a, R: embedded_io_async::BufRead> core::fmt::Debug for RxHeader<'a, R> {
 
 impl<'a, R: embedded_io_async::BufRead> RxHeader<'a, R> {
     pub(crate) async fn read(reader: &'a mut R) -> Result<Self, Error> {
-        let mut fcs = FCS.digest();
+        // Maximum bytes to search for FLAG before giving up
+        // This prevents infinite loops on completely corrupted streams
+        const MAX_FLAG_SEARCH: usize = 1024;
+        // Maximum reasonable frame size (2x the expected max for safety margin)
+        const MAX_REASONABLE_FRAME_SIZE: usize = 256;
 
-        let mut header = [0; 3];
+        let mut total_search_count = 0;
 
-        // Read until we find a FLAG, indicating start/end of frame
-        while header[0] != FLAG {
-            Self::read_exact(reader, &mut header[..1]).await?;
+        // Loop to retry if we find a false FLAG (validation fails)
+        loop {
+            let mut fcs = FCS.digest();
+            let mut header = [0; 3];
+            let mut search_count = 0;
+
+            // Read until we find a FLAG, indicating start/end of frame
+            while header[0] != FLAG {
+                Self::read_exact(reader, &mut header[..1]).await?;
+                search_count += 1;
+                total_search_count += 1;
+                if total_search_count >= MAX_FLAG_SEARCH {
+                    error!("Failed to find valid frame after searching {} bytes. Stream may be corrupted.", total_search_count);
+                    return Err(Error::MalformedFrame);
+                }
+            }
+
+            if search_count > 10 {
+                warn!("Searched {} bytes before finding FLAG", search_count);
+            }
+
+            // Read until we find a non-FLAG byte, indicating start of actual header
+            let mut flag_count = 0;
+            while header[0] == FLAG {
+                Self::read_exact(reader, &mut header[..1]).await?;
+                flag_count += 1;
+                if flag_count >= 100 {
+                    error!("Found {} consecutive FLAG bytes. Stream may be stuck.", flag_count);
+                    return Err(Error::MalformedFrame);
+                }
+            }
+
+            // We have the first byte of the header, read the rest
+            Self::read_exact(reader, &mut header[1..]).await?;
+
+            let id = header[0] >> 2;
+
+            // Validate frame type - if invalid, this is likely a false FLAG
+            let frame_type = match FrameType::try_from(header[1]) {
+                Ok(ft) => ft,
+                Err(Error::UnknownFrameType(byte)) => {
+                    warn!("Unknown frame type {:#02x} ({}). Header bytes: [{:#02x}, {:#02x}, {:#02x}]. Likely false FLAG, continuing search...",
+                        byte, byte, header[0], header[1], header[2]);
+                    // This was a false FLAG, continue searching for next one
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+
+            fcs.update(&header);
+
+            // Read frame length
+            let mut len = (header[2] >> 1) as usize;
+            if (header[2] & EA) != EA {
+                let mut l2 = [0u8; 1];
+                Self::read_exact(reader, &mut l2).await?;
+                fcs.update(&l2);
+                len |= (l2[0] as usize) << 7;
+            };
+
+            // Validate frame length is reasonable
+            if len > MAX_REASONABLE_FRAME_SIZE {
+                warn!("Frame length {} exceeds reasonable max {}. Header bytes: [{:#02x}, {:#02x}, {:#02x}]. Likely false FLAG, continuing search...",
+                    len, MAX_REASONABLE_FRAME_SIZE, header[0], header[1], header[2]);
+                // This was a false FLAG, continue searching for next one
+                continue;
+            }
+
+            // Additional sanity check: DLCI should be reasonable (0-63 per spec, but we use 0-2)
+            // Allow up to 16 to be lenient with buggy implementations
+            if id > 16 {
+                warn!("Frame DLCI {} seems invalid. Header bytes: [{:#02x}, {:#02x}, {:#02x}]. Likely false FLAG, continuing search...",
+                    id, header[0], header[1], header[2]);
+                continue;
+            }
+
+            // All validations passed - this looks like a real frame!
+            return Ok(Self {
+                id,
+                frame_type,
+                len,
+                reader,
+                fcs,
+            });
         }
-
-        // Read until we find a non-FLAG byte, indicating start of actual header
-        while header[0] == FLAG {
-            Self::read_exact(reader, &mut header[..1]).await?;
-        }
-
-        // We have the first byte of the header, read the rest
-        Self::read_exact(reader, &mut header[1..]).await?;
-
-        let id = header[0] >> 2;
-
-        let frame_type = FrameType::try_from(header[1])?;
-
-        fcs.update(&header);
-
-        let mut len = (header[2] >> 1) as usize;
-        if (header[2] & EA) != EA {
-            let mut l2 = [0u8; 1];
-            Self::read_exact(reader, &mut l2).await?;
-            fcs.update(&l2);
-            len |= (l2[0] as usize) << 7;
-        };
-
-        Ok(Self {
-            id,
-            frame_type,
-            len,
-            reader,
-            fcs,
-        })
     }
 
     pub(crate) fn is_control(&self) -> bool {
@@ -714,24 +769,40 @@ impl<'a, R: embedded_io_async::BufRead> RxHeader<'a, R> {
 
     pub(crate) async fn copy<W: embedded_io_async::Write>(&mut self, w: &mut W) -> Result<(), Error> {
         let total_len = self.len;
+        let frame_id = self.id;
 
         while self.len != 0 {
             let remaining = self.len;
+            let copied_so_far = total_len - remaining;
+
             let buf = match self.reader.fill_buf().await {
                 Ok(buf) => buf,
                 Err(e) => {
                     let err = Error::Read(e.kind());
                     error!(
-                        "RxHeader copy: fill_buf failed with {} bytes remaining: {:?}",
-                        remaining, err
+                        "Frame[id={}, type={:?}]: fill_buf failed! Copied {}/{} bytes, {} remaining. Error: {:?}",
+                        frame_id, self.frame_type, copied_so_far, total_len, remaining, err
+                    );
+                    error!(
+                        "Frame[id={}, type={:?}]: This may be due to UART corruption. Frame header claimed {} bytes but stream failed mid-frame.",
+                        frame_id, self.frame_type, total_len
                     );
                     return Err(err);
                 }
             };
+
             if buf.is_empty() {
-                error!("RxHeader copy: EOF with {} bytes remaining", remaining);
+                error!(
+                    "Frame[id={}, type={:?}]: Unexpected EOF! Copied {}/{} bytes, {} remaining.",
+                    frame_id, self.frame_type, copied_so_far, total_len, remaining
+                );
+                error!(
+                    "Frame[id={}, type={:?}]: Frame length may have been wrong, or stream corrupted mid-frame.",
+                    frame_id, self.frame_type
+                );
                 return Err(Error::Read(embedded_io_async::ErrorKind::BrokenPipe));
             }
+
             let n = buf.len().min(self.len);
 
             // FIXME: This should be re-written in a way that allows us to set channel flowcontrol if `w` cannot receive more bytes
@@ -740,20 +811,20 @@ impl<'a, R: embedded_io_async::BufRead> RxHeader<'a, R> {
                 Err(e) => {
                     let err = Error::Write(e.kind());
                     error!(
-                        "RxHeader copy: write failed after copying {} bytes, {} remaining: {:?}",
-                        total_len - remaining,
-                        remaining,
-                        err
+                        "Frame[id={}, type={:?}]: write failed! Copied {}/{} bytes, {} remaining. Error: {:?}",
+                        frame_id, self.frame_type, copied_so_far, total_len, remaining, err
                     );
                     return Err(err);
                 }
             };
+
             if self.frame_type == FrameType::Ui {
                 self.fcs.update(&buf[..n]);
             }
             self.reader.consume(n);
             self.len -= n;
         }
+
         match w.flush().await {
             Ok(()) => {}
             Err(e) => {
@@ -789,14 +860,56 @@ impl<'a, R: embedded_io_async::BufRead> RxHeader<'a, R> {
         let expected_fcs = self.fcs.finalize();
 
         if trailer[1] != FLAG {
-            let mut check_rest = [0; 10];
-            Self::read_exact(self.reader, &mut check_rest).await?;
-            error!("Malformed packet! Expected {:#02x} but got {:#02x}", FLAG, trailer[1]);
-            return Err(Error::MalformedFrame);
+            error!("Malformed frame! Expected FLAG {:#02x} but got {:#02x}. Trailer: [{:#02x}, {:#02x}]",
+                FLAG, trailer[1], trailer[0], trailer[1]);
+            error!("Frame info: id={}, type={:?}, expected_len={}", self.id, self.frame_type, self.len);
+
+            // Try to resynchronize by searching for the next FLAG
+            // Start by checking if trailer[0] is a FLAG
+            if trailer[0] == FLAG {
+                // We already consumed the bytes, so we're positioned after trailer[1]
+                // The next read will start fresh
+                return Err(Error::MalformedFrame);
+            }
+
+            // Search forward for a FLAG to resynchronize
+            warn!("Searching for next FLAG to resynchronize stream...");
+            let mut search_count = 0;
+            const MAX_SEARCH: usize = 512;  // Prevent infinite search
+
+            loop {
+                let buf = self.reader.fill_buf().await.map_err(|e| Error::Read(e.kind()))?;
+                if buf.is_empty() {
+                    error!("EOF while searching for FLAG after {} bytes", search_count);
+                    return Err(Error::Read(embedded_io_async::ErrorKind::BrokenPipe));
+                }
+
+                // Look for FLAG byte in buffer
+                if let Some(pos) = buf.iter().position(|&b| b == FLAG) {
+                    // Found a FLAG! Consume up to (but not including) the FLAG
+                    // so the next RxHeader::read() will find it
+                    self.reader.consume(pos);
+                    warn!("Found FLAG after searching {} bytes, stream resynchronized", search_count + pos);
+                    return Err(Error::MalformedFrame);
+                }
+
+                // No FLAG in this buffer, consume it all and continue
+                let consumed = buf.len();
+                search_count += consumed;
+                self.reader.consume(consumed);
+
+                if search_count >= MAX_SEARCH {
+                    error!("Failed to find FLAG after searching {} bytes, giving up", search_count);
+                    return Err(Error::MalformedFrame);
+                }
+            }
         }
 
         if expected_fcs != GOOD_FCS {
-            error!("bad crc! {:#02x} != {:#02x}", expected_fcs, GOOD_FCS);
+            error!("Bad CRC! Expected {:#02x} but got {:#02x}", GOOD_FCS, expected_fcs);
+            error!("Frame info: id={}, type={:?}, len={}", self.id, self.frame_type, self.len);
+            // Stream position should be OK (we're at the FLAG), so just return error
+            // The next read will start at the FLAG we just validated
             return Err(Error::Crc);
         }
 
@@ -818,13 +931,6 @@ pub trait Frame {
 
     async fn write<W: embedded_io_async::Write>(&self, writer: &mut W) -> Result<(), Error> {
         let information_len = self.information().map_or(0, |i| i.wire_len());
-
-        trace!(
-            "TxHeader {{ id: {}, frame_type: {:?}, len: {}}}",
-            self.id(),
-            Self::FRAME_TYPE,
-            information_len
-        );
 
         let fcs = if information_len < 128 {
             let header = [

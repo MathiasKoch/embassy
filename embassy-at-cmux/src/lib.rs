@@ -159,7 +159,6 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
         max_frame_size: usize,
     ) -> Result<(), Error> {
         let drop_mux = OnDrop::new(|| {
-            debug!("Dropping MUX runner, closing all channels");
             *self.control_channel_opened.borrow_mut() = false;
 
             for line in self.lines.iter() {
@@ -169,8 +168,6 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
         });
 
         if !*self.control_channel_opened.borrow() {
-            debug!("Opening control channel");
-
             // Send open channel request
             if let Err(e) = (frame::Sabm { id: 0 }).write(&mut port_w).await {
                 error!("Failed to send SABM for control channel: {:?}", e);
@@ -180,8 +177,6 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
 
         for channel_id in 0..N {
             if !self.lines[channel_id].opened.get() {
-                debug!("Opening channel {}", channel_id);
-
                 // Send open channel request
                 if let Err(e) = (frame::Sabm {
                     id: channel_id as u8 + 1,
@@ -198,6 +193,10 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
         // let mut last_received = Instant::now();
         // let mut ping_number = 1u8;
         // let mut loop_count = 0u32;
+
+        // Track consecutive frame errors to detect completely corrupted streams
+        let mut consecutive_errors = 0u32;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
 
         loop {
             // loop_count += 1;
@@ -231,17 +230,15 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                     }
 
                     let len = buf.len().min(max_frame_size);
-
                     let frame = frame::Uih {
                         id: i as u8 + 1,
                         information: Information::Data(&buf[..len]),
                     };
 
                     if let Err(e) = frame.write(&mut port_w).await {
-                        error!("Failed to write data frame for channel {}: {:?}", i + 1, e);
+                        error!("CMUX Runner: CH{} failed to write UIH frame: {:?}", i + 1, e);
                         return Err(e);
                     }
-                    
 
                     drop(futs);
 
@@ -249,20 +246,42 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                 }
 
                 Either::Second(Err(e)) => {
-                    error!("CMUX Runner: RX error");
+                    consecutive_errors += 1;
+                    error!("CMUX Runner: RX error: {:?}. Consecutive errors: {}/{}",
+                        e, consecutive_errors, MAX_CONSECUTIVE_ERRORS);
+
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        error!("Too many consecutive frame errors! Stream is likely corrupted. Terminating CMUX.");
+                        return Err(e);
+                    }
+
+                    // RxHeader::read() already tries to find FLAG bytes for synchronization,
+                    // so we can just continue and try again
                     continue;
                 }
                 Either::Second(Ok(mut header)) => {
-                    trace!("{:?}", header);
-
+                    // Successfully read a header, reset error counter
+                    consecutive_errors = 0;
 
                     match header.frame_type {
                         FrameType::Ui | FrameType::Uih if header.is_control() => {
                             let info = match header.read_information().await {
                                 Ok(info) => info,
                                 Err(e) => {
-                                    error!("Failed to read information from control frame: {:?}", e);
-                                    return Err(e);
+                                    consecutive_errors += 1;
+                                    error!("Failed to read information from control frame: {:?}. Consecutive errors: {}/{}",
+                                        e, consecutive_errors, MAX_CONSECUTIVE_ERRORS);
+
+                                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                        error!("Too many consecutive frame errors! Terminating CMUX.");
+                                        return Err(e);
+                                    }
+
+                                    // Try to finalize to resynchronize, then continue
+                                    if let Err(fin_err) = header.finalize().await {
+                                        error!("Failed to finalize after info read error: {:?}", fin_err);
+                                    }
+                                    continue;
                                 }
                             };
 
@@ -271,26 +290,29 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
 
                                 match &info {
                                     Information::MultiplexerCloseDown(_cld) => {
-                                        debug!("The mobile station requested mux-mode termination");
                                         break;
                                     }
                                     Information::TestCommand => {
-                                        debug!("Test command");
                                     }
                                     Information::ModemStatusCommand(msc) => {
-                                        let lines = &self.lines[msc.dlci as usize - 1];
+                                        // Validate DLCI is within bounds
+                                        let channel_idx = msc.dlci as usize - 1;
+                                        if channel_idx >= N {
+                                            warn!(
+                                                "Modem Status Command for invalid DLCI {}: channel index {} out of bounds (max {})",
+                                                msc.dlci, channel_idx, N - 1
+                                            );
+                                            // Still need to acknowledge the command to avoid protocol errors
+                                            if let Err(e) = info.send_ack(&mut port_w).await {
+                                                error!("Failed to send ACK for out-of-bounds MSC: {:?}", e);
+                                                return Err(e);
+                                            }
+                                            continue;
+                                        }
+
+                                        let lines = &self.lines[channel_idx];
                                         let new_control = msc.control.with_ea(false);
                                         let new_brk = msc.brk.map(|b| b.with_ea(false));
-                                        info!(
-                                            "Modem Status for channel {}: rtc={} rtr={} ic={} dv={} (old: {:?} -> new: {:?})",
-                                            msc.dlci,
-                                            new_control.rtc(),
-                                            new_control.rtr(),
-                                            new_control.ic(),
-                                            new_control.dv(),
-                                            lines.rx.get(),
-                                            (new_control, new_brk)
-                                        );
 
                                         // Check if flow control changed
                                         let old_fc = lines.rx.get().0.fc();
@@ -303,15 +325,28 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                                             }
                                         }
 
-                                        // Modem is telling us something about
-                                        // channel `msc.dlci`.
-                                        //
-                                        // We need to ack this message by sending
-                                        // `MSC` with the same payload, but
-                                        // `CR::Response`.
-                                        // lines.rx.set((new_control, new_brk));
-                                        // self.line_status_updated.signal(());
-                                        // lines.check_hangup();
+                                        // Check if data valid flag changed - critical for detecting broken channels!
+                                        let old_dv = lines.rx.get().0.dv();
+                                        let new_dv = new_control.dv();
+
+                                        // Only treat dv: true->false as error if we have recent errors
+                                        // (dv=false during normal channel open is expected)
+                                        if old_dv && !new_dv && consecutive_errors > 0 {
+                                            error!("❌ Channel {} data became INVALID (dv: true -> false) after recent errors!", msc.dlci);
+                                            error!("Channel likely corrupted. CMUX should be restarted!");
+                                            // Mark channel as closed so upper layers know it's broken
+                                            lines.opened.set(false);
+                                            // Return error to force CMUX restart
+                                            return Err(Error::MalformedFrame);
+                                        } else if old_dv && !new_dv {
+                                            // dv went false without recent errors - usually normal during channel open
+                                        } else if !old_dv && new_dv {
+                                            // Channel data became valid - normal operation
+                                        }
+
+                                        // Update stored modem status
+                                        lines.rx.set((new_control, new_brk));
+                                        // Note: line_status_updated signal and check_hangup are not implemented yet
                                     }
                                     n => {
                                         warn!("Unknown command {:?} for the control channel", n);
@@ -351,18 +386,24 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                                     ..
                                 }) = info
                                 {
-                                    warn!(
-                                        "The mobile station didn't support the command sent ({:?})",
-                                        command_type
-                                    );
-                                } else {
-                                    debug!("Command acknowledged by the mobile station");
+                                    warn!("Mobile station didn't support command: {:?}", command_type);
                                 }
                             }
                         }
                         FrameType::Ui | FrameType::Uih => {
                             // data from logical channel
                             let channel_id = header.id() as usize - 1;
+
+                            if channel_id >= N {
+                                warn!("Received data frame for invalid channel ID {}: index {} out of bounds (max {})",
+                                    header.id(), channel_id, N - 1);
+                                // Discard the frame data
+                                if let Err(e) = header.finalize().await {
+                                    error!("Failed to finalize out-of-bounds data frame: {:?}", e);
+                                    return Err(e);
+                                }
+                                continue;
+                            }
 
                             // TODO: Set flow control bits on buffer full here?
                             // let lines = &self.lines[id];
@@ -371,13 +412,25 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                             // self.line_status_updated.signal(());
 
                             if let Err(e) = header.copy(&mut self.rx[channel_id]).await {
-                                error!("Failed to copy data to channel {}: {:?}", channel_id + 1, e);
-                                return Err(e);
+                                consecutive_errors += 1;
+                                error!("Failed to copy data to channel {}: {:?}. Consecutive errors: {}/{}",
+                                    channel_id + 1, e, consecutive_errors, MAX_CONSECUTIVE_ERRORS);
+
+                                if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                                    error!("Too many consecutive copy errors! Terminating CMUX.");
+                                    return Err(e);
+                                }
+
+                                // Copy failed mid-frame. Try to skip to next frame by finalizing
+                                // (which will attempt resynchronization)
+                                warn!("Attempting to skip corrupted frame and resynchronize...");
+                                if let Err(fin_err) = header.finalize().await {
+                                    error!("Failed to finalize after copy error: {:?}", fin_err);
+                                }
+                                continue;
                             }
                         }
                         FrameType::Sabm if header.is_control() => {
-                            // channel open request
-
                             *self.control_channel_opened.borrow_mut() = true;
                             if let Err(e) = (frame::Ua { id: 0 }).write(&mut port_w).await {
                                 error!("Failed to send UA for control channel SABM: {:?}", e);
@@ -386,6 +439,16 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                         }
                         FrameType::Sabm => {
                             let channel_id = header.id() as usize - 1;
+                            if channel_id >= N {
+                                warn!("Received SABM for invalid channel ID {}: index {} out of bounds (max {})",
+                                    header.id(), channel_id, N - 1);
+                                // Respond with DM (Disconnected Mode) to reject the channel
+                                if let Err(e) = (frame::Dm { id: header.id() }).write(&mut port_w).await {
+                                    error!("Failed to send DM for out-of-bounds SABM: {:?}", e);
+                                    return Err(e);
+                                }
+                                continue;
+                            }
                             self.lines[channel_id].opened.set(true);
                             if let Err(e) = (frame::Ua { id: header.id() }).write(&mut port_w).await {
                                 error!("Failed to send UA for channel {} SABM: {:?}", channel_id + 1, e);
@@ -395,40 +458,32 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                         FrameType::Ua if header.is_control() => {
                             if *self.control_channel_opened.borrow() {
                                 *self.control_channel_opened.borrow_mut() = false;
-                                debug!("Control channel closed.");
                             } else {
                                 *self.control_channel_opened.borrow_mut() = true;
-                                debug!("Control channel opened.");
-
-                                // send version Siemens version test
-                                // frame::Uih {
-                                //     id: 0,
-                                //     information: Information::Data(b"\x23\x21\x04TEMUXVERSION2\0\0"),
-                                // }
-                                // .write(&mut port_w)
-                                // .await?;
                             }
                         }
                         FrameType::Ua => {
                             let channel_id = header.id() as usize - 1;
+                            if channel_id >= N {
+                                warn!("Received UA for invalid channel ID {}: index {} out of bounds (max {})",
+                                    header.id(), channel_id, N - 1);
+                                continue;
+                            }
                             if self.lines[channel_id].opened.get() {
-                                debug!("Logical channel {} closed.", channel_id);
                                 self.lines[channel_id].opened.set(false);
                             } else {
-                                debug!("Logical channel {} opened.", channel_id);
                                 self.lines[channel_id].opened.set(true);
                             }
                         }
                         FrameType::Dm if header.is_control() => {
-                            debug!("Couldn't open control channel. -> Terminating MUX");
+                            error!("Couldn't open control channel - terminating CMUX");
                             break;
                         }
                         FrameType::Dm => {
-                            debug!("Logical channel {} couldn't be opened.", header.id() - 1);
+                            warn!("Logical channel {} couldn't be opened", header.id() - 1);
                         }
                         FrameType::Disc if header.is_control() => {
                             if *self.control_channel_opened.borrow() {
-                                debug!("Control channel closed.");
                                 *self.control_channel_opened.borrow_mut() = false;
                                 if let Err(e) = (frame::Ua { id: 0 }).write(&mut port_w).await {
                                     error!("Failed to send UA for control channel DISC: {:?}", e);
@@ -436,7 +491,6 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                                 }
                                 break;
                             } else {
-                                debug!("Received DISC even though control channel was already closed.");
                                 if let Err(e) = (frame::Dm { id: 0 }).write(&mut port_w).await {
                                     error!("Failed to send DM for control channel DISC: {:?}", e);
                                     return Err(e);
@@ -445,15 +499,23 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                         }
                         FrameType::Disc => {
                             let channel_id = header.id() as usize - 1;
+                            if channel_id >= N {
+                                warn!("Received DISC for invalid channel ID {}: index {} out of bounds (max {})",
+                                    header.id(), channel_id, N - 1);
+                                // Respond with DM to acknowledge the disconnect
+                                if let Err(e) = (frame::Dm { id: header.id() }).write(&mut port_w).await {
+                                    error!("Failed to send DM for out-of-bounds DISC: {:?}", e);
+                                    return Err(e);
+                                }
+                                continue;
+                            }
                             if self.lines[channel_id].opened.get() {
                                 self.lines[channel_id].opened.set(false);
-                                debug!("Logical channel {} closed.", channel_id);
                                 if let Err(e) = (frame::Ua { id: header.id() }).write(&mut port_w).await {
                                     error!("Failed to send UA for channel {} DISC: {:?}", channel_id + 1, e);
                                     return Err(e);
                                 }
                             } else {
-                                debug!("Received DISC even though channel {} was already closed.", channel_id);
                                 if let Err(e) = (frame::Dm { id: header.id() }).write(&mut port_w).await {
                                     error!("Failed to send DM for channel {} DISC: {:?}", channel_id + 1, e);
                                     return Err(e);
@@ -463,8 +525,18 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
                     }
 
                     if let Err(e) = header.finalize().await {
-                        error!("Failed to finalize header: {:?}", e);
-                        return Err(e);
+                        consecutive_errors += 1;
+                        error!("Failed to finalize header: {:?}. Consecutive errors: {}/{}",
+                            e, consecutive_errors, MAX_CONSECUTIVE_ERRORS);
+
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            error!("Too many consecutive frame errors! Stream is corrupted. Terminating CMUX.");
+                            return Err(e);
+                        }
+
+                        // Don't terminate yet - the finalize() function has already attempted
+                        // to resynchronize the stream. Continue to try reading the next frame.
+                        continue;
                     }
                 }
             }
@@ -473,7 +545,6 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
         for id in (0..N).rev() {
             let dlci = id + 1;
             let line = &self.lines[id];
-            debug!("Closing down the logical channel {}.", dlci);
             if line.opened.get() {
                 if let Err(e) = (frame::Disc { id: dlci as u8 }).write(&mut port_w).await {
                     error!("Failed to send DISC for channel {}: {:?}", dlci, e);
@@ -483,7 +554,6 @@ impl<'a, const N: usize, const BUF: usize> Runner<'a, N, BUF> {
         }
 
         if *self.control_channel_opened.borrow() {
-            debug!("Sending close down request to the multiplexer.");
             if let Err(e) = (frame::Uih {
                 id: 0,
                 information: Information::MultiplexerCloseDown(MultiplexerCloseDown { cr: frame::CR::Command }),
@@ -631,22 +701,7 @@ impl<'a, const BUF: usize> BufRead for Channel<'a, BUF> {
 
 impl<'a, const BUF: usize> Write for Channel<'a, BUF> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let start = Instant::now();
-        let result = check_hangup(self.tx.write(buf), self.lines).await;
-        let elapsed = Instant::now() - start;
-
-        match &result {
-            Ok(n) => {
-                if elapsed.as_millis() > 50 {
-                    warn!("CMUX TX: write blocked for {}ms, wrote {} bytes", elapsed.as_millis(), n);
-                }
-            }
-            Err(e) => {
-                error!("CMUX TX: write failed after {}ms: {:?}", elapsed.as_millis(), e);
-            }
-        }
-
-        result
+        check_hangup(self.tx.write(buf), self.lines).await
     }
 }
 
@@ -676,22 +731,7 @@ impl<'a, const BUF: usize> ErrorType for ChannelTx<'a, BUF> {
 
 impl<'a, const BUF: usize> Write for ChannelTx<'a, BUF> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let start = Instant::now();
-        let result = check_hangup(self.tx.write(buf), self.lines).await;
-        let elapsed = Instant::now() - start;
-
-        match &result {
-            Ok(n) => {
-                if elapsed.as_millis() > 50 {
-                    warn!("CMUX ChannelTx: write blocked for {}ms, wrote {} bytes", elapsed.as_millis(), n);
-                }
-            }
-            Err(e) => {
-                error!("CMUX ChannelTx: write failed after {}ms: {:?}", elapsed.as_millis(), e);
-            }
-        }
-
-        result
+        check_hangup(self.tx.write(buf), self.lines).await
     }
 }
 
